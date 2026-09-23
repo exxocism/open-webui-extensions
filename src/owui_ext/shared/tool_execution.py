@@ -47,7 +47,6 @@ _core_process_tool_result = None
 
 
 CITATION_TOOLS: set[str] = {
-    "search_web",
     "view_file",
     "view_knowledge_file",
     "query_chat_files",
@@ -119,6 +118,40 @@ async def process_tool_result(
             user=_normalize_user(user),
         )
     )
+
+
+def split_tool_result_files(files: list) -> tuple[list[str], list]:
+    """Match native Core: data images go to the model, other files to display."""
+    images = []
+    display_files = []
+    for file in files:
+        if (
+            isinstance(file, dict)
+            and file.get("type") == "image"
+            and isinstance(file.get("url"), str)
+            and file["url"].startswith("data:")
+        ):
+            images.append(file["url"])
+        else:
+            display_files.append(file)
+    return images, display_files
+
+
+def append_tool_result_images(messages: list[dict], urls: list[str]) -> None:
+    """Keep tool replies contiguous, then attach images as a user message."""
+    if urls:
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Here are the images from the tool results above. Please analyze them.",
+                    },
+                    *[{"type": "image_url", "image_url": {"url": url}} for url in urls],
+                ],
+            }
+        )
 
 
 def structure_terminal_file_tool_result(
@@ -213,22 +246,23 @@ async def emit_terminal_tool_event(
     (display_file / write_file / replace_file_content / run_command);
     unknown names fall through silently.
     """
-    if not event_emitter:
+    if not event_emitter or tool_function_name not in TERMINAL_EVENT_TOOLS:
         return
+    parsed = tool_result
+    if tool_function_name != "run_command" and isinstance(parsed, str):
+        try:
+            parsed = json.loads(parsed)
+        except (ValueError, TypeError):
+            parsed = None
+    resolved_path = parsed.get("path") if isinstance(parsed, dict) else None
     if tool_function_name == "display_file":
-        path = (
+        path = resolved_path or (
             tool_function_params.get("path", "")
             if isinstance(tool_function_params, dict)
             else ""
         )
         if not isinstance(path, str) or not path:
             return
-        parsed = tool_result
-        if isinstance(parsed, str):
-            try:
-                parsed = json.loads(parsed)
-            except Exception:
-                parsed = tool_result
         if isinstance(parsed, dict) and parsed.get("exists") is False:
             return
         page = tool_function_params.get("page")
@@ -242,7 +276,7 @@ async def emit_terminal_tool_event(
             },
         }
     elif tool_function_name in {"write_file", "replace_file_content"}:
-        path = (
+        path = resolved_path or (
             tool_function_params.get("path", "")
             if isinstance(tool_function_params, dict)
             else ""
@@ -287,10 +321,8 @@ async def execute_tool_call(
     tool_function_name = func.get("name", "")
     tool_args_raw = func.get("arguments", "{}")
 
-    tool_function_params: dict = {}
-    if isinstance(tool_args_raw, dict):
-        tool_function_params = tool_args_raw
-    elif isinstance(tool_args_raw, str):
+    tool_function_params = tool_args_raw
+    if isinstance(tool_args_raw, str):
         try:
             tool_function_params = ast.literal_eval(tool_args_raw)
         except Exception:
@@ -305,11 +337,15 @@ async def execute_tool_call(
                     "content": f"Error parsing arguments: {exc}",
                 }
     if not isinstance(tool_function_params, dict):
-        tool_function_params = {}
+        return {
+            "tool_call_id": tool_call_id,
+            "content": "Error: Tool call arguments must be a JSON object.",
+        }
 
     tool_result: Any = None
     tool_result_files: list[dict] = []
     tool_result_embeds: list[Any] = []
+    tool_result_images: list[str] = []
     emit_terminal_event = False
     if tool_function_name in tools_dict:
         tool = tools_dict[tool_function_name]
@@ -365,6 +401,7 @@ async def execute_tool_call(
                 metadata=extra_params.get("__metadata__"),
                 user=extra_params.get("__user__"),
             )
+            tool_result_images, tool_result_files = split_tool_result_files(tool_result_files)
             emit_terminal_event = True
 
         except Exception as exc:
@@ -416,4 +453,5 @@ async def execute_tool_call(
     return {
         "tool_call_id": tool_call_id,
         "content": tool_result,
+        **({"images": tool_result_images} if tool_result_images else {}),
     }

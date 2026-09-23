@@ -1,7 +1,7 @@
 """
 title: Sub Agent
 author: skyzi000
-version: 0.6.1
+version: 0.6.2
 license: MIT
 required_open_webui_version: 0.9.6
 description: Run autonomous, tool-heavy tasks in a sub-agent and keep the main chat context clean.
@@ -85,6 +85,7 @@ from owui_ext.shared.ref_exec import (
     render_truncate_preview_sync,
 )
 from owui_ext.shared.tool_execution import (
+    append_tool_result_images,
     execute_direct_tool_call,
     execute_tool_call,
     normalize_terminal_tools_result,
@@ -264,6 +265,7 @@ class _LoopRunState:
         filter_identity: Any,
         tool_server_prompt_signature: Any,
         tool_server_prompt_texts: str = "",
+        terminal_agents_md: str = "",
         model_system_prompt: str | None = None,
     ) -> None:
         self.store = RefRunStore()
@@ -283,6 +285,7 @@ class _LoopRunState:
         self.filter_identity = filter_identity
         self.tool_server_prompt_signature = tool_server_prompt_signature
         self.tool_server_prompt_texts = tool_server_prompt_texts
+        self.terminal_agents_md = terminal_agents_md
         self.model_system_prompt = model_system_prompt
         self.last_sent_form_data: Optional[dict] = None
 
@@ -599,6 +602,10 @@ async def _estimate_loop_tokens(
     estimation_body: dict[str, Any] = {
         "messages": await _estimation_messages(run, current_messages)
     }
+    if run.terminal_agents_md:
+        estimation_body = _append_tool_server_prompts(
+            estimation_body, {"__terminal_agents_md__": run.terminal_agents_md}
+        )
     if run.model_system_prompt:
         from open_webui.utils.payload import apply_system_prompt_to_body
 
@@ -1012,6 +1019,7 @@ async def run_sub_agent_loop(
     iteration_note_role: Literal["user", "system"] = "user",
     compaction: Optional[LoopCompactionOptions] = None,
     large_results: Optional[LargeToolResultOptions] = None,
+    filter_pipeline: Optional[dict] = None,
 ) -> str:
     """Run the sub-agent tool loop until completion.
 
@@ -1043,12 +1051,13 @@ async def run_sub_agent_loop(
     else:
         user_obj = user
 
-    filter_pipeline = await resolve_model_filter_pipeline(
-        apply_inlet_filters,
-        request,
-        model_id,
-        extra_params.get("__metadata__", {}).get("filter_ids", []),
-    )
+    if filter_pipeline is None:
+        filter_pipeline = await resolve_model_filter_pipeline(
+            apply_inlet_filters,
+            request,
+            model_id,
+            extra_params.get("__metadata__", {}).get("filter_ids", []),
+        )
 
     compaction_options = compaction or LoopCompactionOptions()
     large_result_options = large_results or LargeToolResultOptions()
@@ -1077,6 +1086,9 @@ async def run_sub_agent_loop(
             "compaction will not trigger for this loop"
         )
     filter_identity = list(extra_params.get("__metadata__", {}).get("filter_ids", []))
+    terminal_agents_md = extra_params.get("__terminal_agents_md__")
+    if not isinstance(terminal_agents_md, str):
+        terminal_agents_md = ""
     tool_server_prompts = []
     terminal_prompt = (extra_params or {}).get("__terminal_system_prompt__")
     if isinstance(terminal_prompt, str) and terminal_prompt.strip():
@@ -1095,12 +1107,14 @@ async def run_sub_agent_loop(
         encoder_ready=encoder is not None,
         filter_identity=filter_identity,
         tool_server_prompt_signature={
+            "agents_md": hashlib.sha256(terminal_agents_md.encode("utf-8")).hexdigest(),
             "prompts": [
                 hashlib.sha256(prompt.encode("utf-8")).hexdigest()
                 for prompt in tool_server_prompts
             ]
         },
         tool_server_prompt_texts="\n\n".join(tool_server_prompts),
+        terminal_agents_md=terminal_agents_md,
         model_system_prompt=model_system_prompt,
     )
 
@@ -1351,6 +1365,7 @@ async def run_sub_agent_loop(
             )
 
             # Execute each tool call
+            tool_images = []
             for tool_call in normalized_tool_calls:
                 tc_func = tool_call.get("function")
                 tool_args_raw = tc_func.get("arguments", "{}") if isinstance(tc_func, dict) else "{}"
@@ -1378,6 +1393,7 @@ async def run_sub_agent_loop(
                 )
 
                 # Emit status with tool result
+                tool_images.extend(result.get("images", []))
                 if event_emitter:
                     result_content = result["content"].replace(chr(10), ' ') if result["content"] else "(empty)"
                     await event_emitter(
@@ -1398,6 +1414,8 @@ async def run_sub_agent_loop(
                         "content": result["content"],
                     }
                 )
+
+            append_tool_result_images(current_messages, tool_images)
 
     # Max iterations reached
     if event_emitter:
@@ -1612,6 +1630,7 @@ async def load_sub_agent_tools(
         extra_params=extra_params,
         tool_id_list=tool_id_list,
         excluded_tool_ids=excluded,
+        include_terminal_agents_md=True,
         resolved_terminal_id=terminal_id,
         resolved_direct_tool_servers=direct_tool_servers,
     )
@@ -1921,26 +1940,12 @@ RESPONSE REQUIREMENTS:
                 }
             )
 
-        # Resolve the model dict for the actual sub-agent model.
-        # When DEFAULT_MODEL differs from the parent model, __model__ carries
-        # the parent's capabilities; we need the sub-agent model's dict so
-        # get_builtin_tools can correctly check capabilities (web_search, etc.).
-        resolved_model = __model__ or {}
-        if model_id and model_id != resolved_model.get("id", ""):
-            try:
-                resolved_model = __request__.app.state.MODELS.get(
-                    model_id, resolved_model
-                )
-            except Exception:
-                pass  # Fall back to parent model
-
         common_extra_params = {
             "__user__": __user__,
             "__event_emitter__": __event_emitter__,
             "__event_call__": __event_call__,
             "__request__": __request__,
-            "__model__": resolved_model,
-            "__metadata__": __metadata__,
+            "__metadata__": dict(__metadata__ or {}),
             "__chat_id__": __chat_id__,
             "__message_id__": __message_id__,
             "__oauth_token__": __oauth_token__,
@@ -1960,11 +1965,19 @@ RESPONSE REQUIREMENTS:
                     }
                 )
 
+            filter_pipeline = await resolve_model_filter_pipeline(
+                self.valves.APPLY_INLET_FILTERS,
+                __request__,
+                model_id,
+                common_extra_params["__metadata__"].get("filter_ids", []),
+            )
+            resolved_model = filter_pipeline["model"]
+            common_extra_params["__model__"] = resolved_model
             tools_dict, mcp_clients = await load_sub_agent_tools(
                 request=__request__,
                 user=user,
                 valves=self.valves,
-                metadata=__metadata__ or {},
+                metadata=common_extra_params["__metadata__"],
                 model=resolved_model,
                 extra_params=common_extra_params,
                 self_tool_id=__id__,
@@ -2014,6 +2027,7 @@ RESPONSE REQUIREMENTS:
                     event_emitter=__event_emitter__,
                     extra_params=common_extra_params,
                     apply_inlet_filters=self.valves.APPLY_INLET_FILTERS,
+                    filter_pipeline=filter_pipeline,
                     iteration_note_role=self.valves.ITERATION_NOTE_ROLE,
                     compaction=LoopCompactionOptions(
                         enabled=self.valves.ENABLE_CONTEXT_COMPACTION,
@@ -2148,16 +2162,6 @@ RESPONSE REQUIREMENTS:
                 ensure_ascii=False,
             )
 
-        # Resolve the model dict for the actual sub-agent model (same as run_sub_agent).
-        resolved_model = __model__ or {}
-        if model_id and model_id != resolved_model.get("id", ""):
-            try:
-                resolved_model = __request__.app.state.MODELS.get(
-                    model_id, resolved_model
-                )
-            except Exception:
-                pass
-
         # NOTE: __chat_id__ / __message_id__ are intentionally shared across
         # all parallel tasks.  They reference the *parent* conversation message
         # that triggered this tool call; sub-agents build their own internal
@@ -2170,37 +2174,60 @@ RESPONSE REQUIREMENTS:
             "__event_emitter__": __event_emitter__,
             "__event_call__": __event_call__,
             "__request__": __request__,
-            "__model__": resolved_model,
-            "__metadata__": __metadata__,
+            "__metadata__": __metadata__ or {},
             "__chat_id__": __chat_id__,
             "__message_id__": __message_id__,
             "__oauth_token__": __oauth_token__,
             "__files__": __metadata__.get("files", []) if __metadata__ else [],
         }
 
-        # Tools are loaded once and shared across all parallel tasks for
-        # efficiency.  This is safe because execute_tool_call rebinds
-        # __event_emitter__ per invocation via get_updated_tool_function.
-        # Caveat: tools that store __event_emitter__ on `self` (non-standard
-        # pattern) could see cross-task interference.
         task_mapping = ", ".join(
             f"[{i + 1}] {task['description']}" for i, task in enumerate(validated_tasks)
         )
-        mcp_clients = {}
-        try:
+        # Share tools and loaded context per effective model while each task
+        # keeps its own Arena selection and filter pipeline.
+        tools_cache: dict[str, tuple[dict, dict]] = {}
+        all_mcp_clients: list[dict] = []
+
+        async def ensure_tools(filter_pipeline: dict):
+            effective_model_id = filter_pipeline["model_id"]
+            cached = tools_cache.get(effective_model_id)
+            if cached is not None:
+                return cached
+            loader_extra_params = {
+                **common_extra_params,
+                "__model__": filter_pipeline["model"],
+                "__metadata__": dict(common_extra_params["__metadata__"]),
+            }
             tools_dict, mcp_clients = await load_sub_agent_tools(
                 request=__request__,
                 user=user,
                 valves=self.valves,
-                metadata=__metadata__ or {},
-                model=resolved_model,
-                extra_params=common_extra_params,
+                metadata=loader_extra_params["__metadata__"],
+                model=filter_pipeline["model"],
+                extra_params=loader_extra_params,
                 self_tool_id=__id__,
             )
-
-            # Register view_skill if model-attached skills manifest is available
+            # Record live clients before skill setup can fail or be cancelled.
+            if mcp_clients:
+                all_mcp_clients.append(mcp_clients)
             if skill_manifest and self.valves.ENABLE_SKILLS_TOOLS:
-                await register_view_skill(tools_dict, __request__, common_extra_params)
+                await register_view_skill(tools_dict, __request__, loader_extra_params)
+            cached = (tools_dict, loader_extra_params)
+            tools_cache[effective_model_id] = cached
+            return cached
+
+        try:
+            # MCP sessions must be opened and closed by this same parent task.
+            prepared_tasks = []
+            for _task in validated_tasks:
+                filter_pipeline = await resolve_model_filter_pipeline(
+                    self.valves.APPLY_INLET_FILTERS,
+                    __request__,
+                    model_id,
+                    common_extra_params["__metadata__"].get("filter_ids", []),
+                )
+                prepared_tasks.append((filter_pipeline, await ensure_tools(filter_pipeline)))
 
             # Build system content with skills context
             parallel_prompt_sections: list[str] = [user_valves.SYSTEM_PROMPT]
@@ -2246,6 +2273,16 @@ RESPONSE REQUIREMENTS:
                     await __event_emitter__(event)
 
                 try:
+                    filter_pipeline, (tools_dict, loaded_extra_params) = prepared_tasks[task_index - 1]
+                    extra_params = {
+                        **loaded_extra_params,
+                        "__model__": filter_pipeline["model"],
+                        "__metadata__": dict(loaded_extra_params["__metadata__"]),
+                        "__event_emitter__": indexed_event_emitter
+                        if __event_emitter__
+                        else None,
+                    }
+
                     result = await run_sub_agent_loop(
                         request=__request__,
                         user=user,
@@ -2257,13 +2294,9 @@ RESPONSE REQUIREMENTS:
                         tools_dict=tools_dict,
                         max_iterations=self.valves.MAX_ITERATIONS,
                         event_emitter=indexed_event_emitter if __event_emitter__ else None,
-                        extra_params={
-                            **common_extra_params,
-                            "__event_emitter__": indexed_event_emitter
-                            if __event_emitter__
-                            else None,
-                        },
+                        extra_params=extra_params,
                         apply_inlet_filters=self.valves.APPLY_INLET_FILTERS,
+                        filter_pipeline=filter_pipeline,
                         iteration_note_role=self.valves.ITERATION_NOTE_ROLE,
                         compaction=LoopCompactionOptions(
                             enabled=self.valves.ENABLE_CONTEXT_COMPACTION,
@@ -2326,4 +2359,4 @@ RESPONSE REQUIREMENTS:
             )
             raise
         finally:
-            await cleanup_mcp_clients(mcp_clients)
+            await cleanup_mcp_clients(*all_mcp_clients)

@@ -2,7 +2,7 @@
 title: LLM Review
 description: Run a collaborative writing process where multiple persona agents each produce a distinct, original draft — drafting independently, reviewing peers, and revising their own draft across multiple rounds. Returns one divergent draft per persona rather than a merged output. Independent implementation inspired by arXiv:2601.08003 "LLM Review".
 author: https://github.com/skyzi000
-version: 0.5.9
+version: 0.5.10
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -503,7 +503,7 @@ def truncate_text(value: str, limit: int = 200) -> str:
 
 
 def _append_tool_server_prompts(form_data: dict, extra_params: dict) -> dict:
-    """Append terminal/direct-tool-server system prompts to messages.
+    """Add terminal instructions and tool-server prompts to a request snapshot.
 
     Open WebUI core injects these prompts AFTER inlet filters so they survive
     filters that rewrite the system message.  We replicate the same ordering by
@@ -518,11 +518,14 @@ def _append_tool_server_prompts(form_data: dict, extra_params: dict) -> dict:
     )
     if isinstance(direct_prompts, list):
         prompts.extend(p for p in direct_prompts if isinstance(p, str) and p.strip())
-    if not prompts:
+    agents_md = (extra_params or {}).get("__terminal_agents_md__")
+    if not isinstance(agents_md, str):
+        agents_md = ""
+    if not prompts and not agents_md:
         return form_data
     messages = list(form_data.get("messages", []))
     combined = "\n\n".join(prompts)
-    if messages and messages[0].get("role") == "system":
+    if combined and messages and messages[0].get("role") == "system":
         msg = {**messages[0]}
         content = msg.get("content", "")
         if isinstance(content, list):
@@ -537,8 +540,18 @@ def _append_tool_server_prompts(form_data: dict, extra_params: dict) -> dict:
         else:
             msg["content"] = f"{content}\n\n{combined}" if content else combined
         messages[0] = msg
-    else:
+    elif combined:
         messages.insert(0, {"role": "system", "content": combined})
+    if agents_md and not any(
+        message.get("role") == "user" and message.get("content") == agents_md
+        for message in messages
+    ):
+        try:
+            from open_webui.utils.terminals import add_terminal_agents_md
+        except ImportError:
+            pass  # Older Core versions do not support terminal AGENTS.md.
+        else:
+            messages = add_terminal_agents_md(messages, agents_md)
     form_data["messages"] = messages
     return form_data
 
@@ -554,7 +567,6 @@ _core_process_tool_result = None
 
 
 CITATION_TOOLS: set[str] = {
-    "search_web",
     "view_file",
     "view_knowledge_file",
     "query_chat_files",
@@ -626,6 +638,40 @@ async def process_tool_result(
             user=_normalize_user(user),
         )
     )
+
+
+def split_tool_result_files(files: list) -> tuple[list[str], list]:
+    """Match native Core: data images go to the model, other files to display."""
+    images = []
+    display_files = []
+    for file in files:
+        if (
+            isinstance(file, dict)
+            and file.get("type") == "image"
+            and isinstance(file.get("url"), str)
+            and file["url"].startswith("data:")
+        ):
+            images.append(file["url"])
+        else:
+            display_files.append(file)
+    return images, display_files
+
+
+def append_tool_result_images(messages: list[dict], urls: list[str]) -> None:
+    """Keep tool replies contiguous, then attach images as a user message."""
+    if urls:
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Here are the images from the tool results above. Please analyze them.",
+                    },
+                    *[{"type": "image_url", "image_url": {"url": url}} for url in urls],
+                ],
+            }
+        )
 
 
 def structure_terminal_file_tool_result(
@@ -720,22 +766,23 @@ async def emit_terminal_tool_event(
     (display_file / write_file / replace_file_content / run_command);
     unknown names fall through silently.
     """
-    if not event_emitter:
+    if not event_emitter or tool_function_name not in TERMINAL_EVENT_TOOLS:
         return
+    parsed = tool_result
+    if tool_function_name != "run_command" and isinstance(parsed, str):
+        try:
+            parsed = json.loads(parsed)
+        except (ValueError, TypeError):
+            parsed = None
+    resolved_path = parsed.get("path") if isinstance(parsed, dict) else None
     if tool_function_name == "display_file":
-        path = (
+        path = resolved_path or (
             tool_function_params.get("path", "")
             if isinstance(tool_function_params, dict)
             else ""
         )
         if not isinstance(path, str) or not path:
             return
-        parsed = tool_result
-        if isinstance(parsed, str):
-            try:
-                parsed = json.loads(parsed)
-            except Exception:
-                parsed = tool_result
         if isinstance(parsed, dict) and parsed.get("exists") is False:
             return
         page = tool_function_params.get("page")
@@ -749,7 +796,7 @@ async def emit_terminal_tool_event(
             },
         }
     elif tool_function_name in {"write_file", "replace_file_content"}:
-        path = (
+        path = resolved_path or (
             tool_function_params.get("path", "")
             if isinstance(tool_function_params, dict)
             else ""
@@ -794,10 +841,8 @@ async def execute_tool_call(
     tool_function_name = func.get("name", "")
     tool_args_raw = func.get("arguments", "{}")
 
-    tool_function_params: dict = {}
-    if isinstance(tool_args_raw, dict):
-        tool_function_params = tool_args_raw
-    elif isinstance(tool_args_raw, str):
+    tool_function_params = tool_args_raw
+    if isinstance(tool_args_raw, str):
         try:
             tool_function_params = ast.literal_eval(tool_args_raw)
         except Exception:
@@ -812,11 +857,15 @@ async def execute_tool_call(
                     "content": f"Error parsing arguments: {exc}",
                 }
     if not isinstance(tool_function_params, dict):
-        tool_function_params = {}
+        return {
+            "tool_call_id": tool_call_id,
+            "content": "Error: Tool call arguments must be a JSON object.",
+        }
 
     tool_result: Any = None
     tool_result_files: list[dict] = []
     tool_result_embeds: list[Any] = []
+    tool_result_images: list[str] = []
     emit_terminal_event = False
     if tool_function_name in tools_dict:
         tool = tools_dict[tool_function_name]
@@ -872,6 +921,7 @@ async def execute_tool_call(
                 metadata=extra_params.get("__metadata__"),
                 user=extra_params.get("__user__"),
             )
+            tool_result_images, tool_result_files = split_tool_result_files(tool_result_files)
             emit_terminal_event = True
 
         except Exception as exc:
@@ -923,6 +973,7 @@ async def execute_tool_call(
     return {
         "tool_call_id": tool_call_id,
         "content": tool_result,
+        **({"images": tool_result_images} if tool_result_images else {}),
     }
 
 # --- inlined from src/owui_ext/shared/mcp_tools.py (owui_ext.shared.mcp_tools) ---
@@ -1148,58 +1199,50 @@ async def resolve_mcp_tools(
             seen_server_ids.add(server_id)
             ordered_server_ids.append(server_id)
 
-    for server_id in ordered_server_ids:
-        client = None
-        try:
-            mcp_server_connection = next(
-                (
-                    server_connection
-                    for server_connection in server_connections
-                    if server_connection.get("type", "") == "mcp"
-                    and server_connection.get("info", {}).get("id") == server_id
-                ),
-                None,
-            )
-
-            if not mcp_server_connection:
-                _mcp_tools_log.warning(f"MCP server with id {server_id} not found")
-                await emit_warning(f"MCP server '{server_id}' was not found")
-                continue
-
-            if not mcp_server_connection.get("config", {}).get("enable", True):
-                if debug:
-                    _mcp_tools_log.info(
-                        f"MCP server {server_id} is disabled; skipping"
-                    )
-                await emit_warning(f"MCP server '{server_id}' is disabled")
-                continue
-
+    try:
+        for server_id in ordered_server_ids:
+            client = None
             try:
-                has_access = await _mcp_maybe_await(
-                    has_connection_access(user, mcp_server_connection)
-                )
-            except TypeError:
-                has_access = await _mcp_maybe_await(
-                    has_connection_access(user, mcp_server_connection, None)
+                mcp_server_connection = next(
+                    (
+                        server_connection
+                        for server_connection in server_connections
+                        if server_connection.get("type", "") == "mcp"
+                        and server_connection.get("info", {}).get("id") == server_id
+                    ),
+                    None,
                 )
 
-            if not has_access:
-                _mcp_tools_log.warning(
-                    f"Access denied to MCP server {server_id} for user {user.id}"
-                )
-                await emit_warning(f"Access denied to MCP server '{server_id}'")
-                continue
+                if not mcp_server_connection:
+                    _mcp_tools_log.warning(f"MCP server with id {server_id} not found")
+                    await emit_warning(f"MCP server '{server_id}' was not found")
+                    continue
 
-            headers = await _build_mcp_headers_with_core(
-                connection=mcp_server_connection,
-                request=request,
-                user=user,
-                server_id=server_id,
-                metadata=metadata,
-                extra_params=extra_params,
-            )
-            if headers is None:
-                headers = await _build_mcp_headers_legacy(
+                if not mcp_server_connection.get("config", {}).get("enable", True):
+                    if debug:
+                        _mcp_tools_log.info(
+                            f"MCP server {server_id} is disabled; skipping"
+                        )
+                    await emit_warning(f"MCP server '{server_id}' is disabled")
+                    continue
+
+                try:
+                    has_access = await _mcp_maybe_await(
+                        has_connection_access(user, mcp_server_connection)
+                    )
+                except TypeError:
+                    has_access = await _mcp_maybe_await(
+                        has_connection_access(user, mcp_server_connection, None)
+                    )
+
+                if not has_access:
+                    _mcp_tools_log.warning(
+                        f"Access denied to MCP server {server_id} for user {user.id}"
+                    )
+                    await emit_warning(f"Access denied to MCP server '{server_id}'")
+                    continue
+
+                headers = await _build_mcp_headers_with_core(
                     connection=mcp_server_connection,
                     request=request,
                     user=user,
@@ -1207,105 +1250,121 @@ async def resolve_mcp_tools(
                     metadata=metadata,
                     extra_params=extra_params,
                 )
+                if headers is None:
+                    headers = await _build_mcp_headers_legacy(
+                        connection=mcp_server_connection,
+                        request=request,
+                        user=user,
+                        server_id=server_id,
+                        metadata=metadata,
+                        extra_params=extra_params,
+                    )
 
-            function_name_filter_list = mcp_server_connection.get("config", {}).get(
-                "function_name_filter_list", ""
-            )
-            if isinstance(function_name_filter_list, str):
-                function_name_filter_list = [
-                    item.strip()
-                    for item in function_name_filter_list.split(",")
-                    if item.strip()
-                ]
-
-            client = MCPClient()
-            client_lock = asyncio.Lock()
-            setattr(client, "_sub_agent_lock", client_lock)
-
-            await client.connect(
-                url=mcp_server_connection.get("url", ""),
-                headers=headers if headers else None,
-            )
-
-            tool_specs = await client.list_tool_specs() or []
-
-            def make_tool_function(
-                mcp_client: Any,
-                function_name: str,
-                lock: asyncio.Lock,
-            ) -> Callable[..., Any]:
-                async def tool_function(**kwargs):
-                    async with lock:
-                        return await mcp_client.call_tool(
-                            function_name,
-                            function_args=kwargs,
-                        )
-
-                return tool_function
-
-            loaded_tool_count = 0
-            for tool_spec in tool_specs:
-                if not isinstance(tool_spec, dict):
-                    continue
-
-                tool_name = tool_spec.get("name")
-                if not isinstance(tool_name, str) or not tool_name:
-                    continue
-
-                if function_name_filter_list and not is_string_allowed(
-                    tool_name, function_name_filter_list
-                ):
-                    continue
-
-                safe_prefix = re.sub(r"[^a-zA-Z0-9_-]", "_", server_id)
-                prefixed_name = f"{safe_prefix}_{tool_name}"
-                mcp_tools_dict[prefixed_name] = {
-                    "spec": {
-                        **tool_spec,
-                        "name": prefixed_name,
-                    },
-                    "callable": make_tool_function(client, tool_name, client_lock),
-                    "type": "mcp",
-                    "direct": False,
-                }
-                loaded_tool_count += 1
-
-            mcp_clients[server_id] = client
-
-            if debug:
-                _mcp_tools_log.info(
-                    f"Loaded {loaded_tool_count} MCP tools from server {server_id}"
+                function_name_filter_list = mcp_server_connection.get("config", {}).get(
+                    "function_name_filter_list", ""
                 )
-        except Exception as e:
-            _mcp_tools_log.warning(
-                f"Failed to load MCP tools from {server_id}: {e}"
-            )
-            if client is not None:
-                try:
-                    await client.disconnect()
-                except BaseException:
-                    pass
-            await emit_warning(f"Could not load MCP tools from '{server_id}': {e}")
+                if isinstance(function_name_filter_list, str):
+                    function_name_filter_list = [
+                        item.strip()
+                        for item in function_name_filter_list.split(",")
+                        if item.strip()
+                    ]
+
+                client = MCPClient()
+                # Own the client before connect/listing can be cancelled.
+                mcp_clients[server_id] = client
+                client_lock = asyncio.Lock()
+                setattr(client, "_sub_agent_lock", client_lock)
+
+                await client.connect(
+                    url=mcp_server_connection.get("url", ""),
+                    headers=headers if headers else None,
+                )
+
+                tool_specs = await client.list_tool_specs() or []
+
+                def make_tool_function(
+                    mcp_client: Any,
+                    function_name: str,
+                    lock: asyncio.Lock,
+                ) -> Callable[..., Any]:
+                    async def tool_function(**kwargs):
+                        async with lock:
+                            return await mcp_client.call_tool(
+                                function_name,
+                                function_args=kwargs,
+                            )
+
+                    return tool_function
+
+                loaded_tool_count = 0
+                for tool_spec in tool_specs:
+                    if not isinstance(tool_spec, dict):
+                        continue
+
+                    tool_name = tool_spec.get("name")
+                    if not isinstance(tool_name, str) or not tool_name:
+                        continue
+
+                    if function_name_filter_list and not is_string_allowed(
+                        tool_name, function_name_filter_list
+                    ):
+                        continue
+
+                    safe_prefix = re.sub(r"[^a-zA-Z0-9_-]", "_", server_id)
+                    prefixed_name = f"{safe_prefix}_{tool_name}"
+                    mcp_tools_dict[prefixed_name] = {
+                        "spec": {
+                            **tool_spec,
+                            "name": prefixed_name,
+                        },
+                        "callable": make_tool_function(client, tool_name, client_lock),
+                        "type": "mcp",
+                        "direct": False,
+                    }
+                    loaded_tool_count += 1
+
+                if debug:
+                    _mcp_tools_log.info(
+                        f"Loaded {loaded_tool_count} MCP tools from server {server_id}"
+                    )
+            except Exception as e:
+                _mcp_tools_log.warning(
+                    f"Failed to load MCP tools from {server_id}: {e}"
+                )
+                if client is not None:
+                    mcp_clients.pop(server_id, None)
+                    await cleanup_mcp_clients({server_id: client})
+                await emit_warning(f"Could not load MCP tools from '{server_id}': {e}")
+    except BaseException:
+        await cleanup_mcp_clients(mcp_clients)
+        raise
 
     return mcp_tools_dict, mcp_clients
 
 
-async def cleanup_mcp_clients(mcp_clients: dict) -> None:
-    """Disconnect all MCP clients, absorbing non-Exception failures.
+async def cleanup_mcp_clients(mcp_clients: dict | None = None, *more_clients: dict) -> None:
+    """Close client groups in reverse acquisition order in their opening task.
 
-    Some callers open MCP clients inside child tasks (e.g. coroutines
-    fed to ``asyncio.gather``) and close them from an outer ``finally``.
-    Catching ``BaseException`` keeps anyio cancel-scope failures (raised
-    outside the ``Exception`` hierarchy on cross-task cleanup) and
-    ``asyncio.CancelledError`` from escaping the caller and discarding
-    the tool's response. Matches upstream Open WebUI main.py chat
-    handler MCP cleanup (#24105).
+    Error suppression cannot repair cross-task or out-of-order teardown.
+    Preserve the response on internal cleanup errors, but re-raise genuine
+    task cancellation after attempting the remaining clients.
     """
-    for client in reversed(list((mcp_clients or {}).values())):
-        try:
-            await client.disconnect()
-        except BaseException as e:
-            _mcp_tools_log.debug(f"Error cleaning up MCP client: {e}")
+    cancelled = None
+    for clients in reversed((mcp_clients, *more_clients)):
+        for client in reversed(list((clients or {}).values())):
+            try:
+                await client.disconnect()
+            except asyncio.CancelledError as exc:
+                task = asyncio.current_task()
+                if task is not None and task.cancelling():
+                    cancelled = exc
+                else:
+                    _mcp_tools_log.debug(f"Internal MCP cleanup cancellation: {exc}")
+            except BaseException as exc:
+                _mcp_tools_log.debug(f"Error cleaning up MCP client: {exc}")
+    if cancelled is not None:
+        raise cancelled
 
 # --- inlined from src/owui_ext/shared/models.py (owui_ext.shared.models) ---
 import logging
@@ -1427,8 +1486,8 @@ def extract_skill_manifest(messages: Optional[list]) -> str:
     """Extract the ``<available_skills>`` manifest from the parent
     conversation's system messages.
 
-    Since v0.8.2, only **model-attached** skills appear in this manifest.
-    User-selected skills are injected as full ``<skill>`` tags instead
+    Core can list model-attached, accessible workspace, and terminal skills.
+    Inline skills may also appear as full ``<skill>`` tags
     (see :func:`extract_user_skill_tags`).
 
     Args:
@@ -1445,9 +1504,8 @@ def extract_user_skill_tags(messages: Optional[list]) -> list[str]:
     """Extract ``<skill name="...">content</skill>`` tags from the parent
     conversation's system messages.
 
-    Since Open WebUI v0.8.2, user-selected skills are injected as individual
-    ``<skill>`` tags with full content (as opposed to the lazy-loading
-    manifest used for model-attached skills).
+    Mentioned skills, or selected skills on older Core / without builtin
+    tools, can appear as ``<skill>`` tags alongside the available manifest.
 
     Args:
         messages: The parent conversation messages (``__messages__``).
@@ -1465,13 +1523,12 @@ async def register_view_skill(
 ) -> None:
     """Manually register the view_skill builtin tool in tools_dict.
 
-    This is needed for **model-attached** skills whose content is not injected
-    inline.  The agent loop can call ``view_skill`` to lazily load their
+    This is needed for available skills whose content is not injected
+    inline. The agent loop can call ``view_skill`` to lazily load their
     content from the ``<available_skills>`` manifest.
 
-    Since v0.8.2, user-selected skills are injected as full ``<skill>`` tags
-    and do NOT require ``view_skill``; they are passed directly in the system
-    message.
+    Skills already supplied as full ``<skill>`` tags do not require
+    ``view_skill``; they are passed directly in the system message.
 
     Args:
         tools_dict: The tools dict to add view_skill to (modified in-place).
@@ -1561,8 +1618,43 @@ async def resolve_direct_tool_servers_from_request_and_metadata(
 ) -> list[dict]:
     """Resolve direct tool servers using core-gated metadata as source of truth."""
     metadata_has_tool_servers = isinstance(metadata, dict) and "tool_servers" in metadata
+    servers: list[dict] = []
+    missing_prompts: list[tuple[dict, dict]] = []
+
+    def connection_settings(server: dict) -> dict:
+        return {
+            key: value for key, value in server.items()
+            if key not in {"specs", "system_prompt"}
+        }
+
     if metadata_has_tool_servers:
-        return normalize_direct_tool_servers(metadata.get("tool_servers"))
+        servers = normalize_direct_tool_servers(metadata.get("tool_servers"))
+        parent_tools = metadata.get("tools")
+        parent_tools = parent_tools if isinstance(parent_tools, dict) else {}
+        for server in servers:
+            if "specs" in server and "system_prompt" in server:
+                continue
+            settings = connection_settings(server)
+            approved_specs = [
+                dict(tool["spec"])
+                for tool in parent_tools.values()
+                if isinstance(tool, dict)
+                and tool.get("direct") is True
+                and isinstance(tool.get("server"), dict)
+                and connection_settings(tool["server"]) == settings
+                and isinstance(tool.get("spec"), dict)
+                and isinstance(tool["spec"].get("name"), str)
+                and tool["spec"]["name"]
+            ]
+            # Core pops specs from metadata.tool_servers, but retains only
+            # the permitted entries in metadata.tools. Never use raw specs
+            # to recreate a tool that Core removed.
+            if "specs" not in server and approved_specs:
+                server["specs"] = approved_specs
+            if approved_specs and server.get("specs") and "system_prompt" not in server:
+                missing_prompts.append((server, settings))
+        if not missing_prompts:
+            return servers
 
     request_servers: list[dict] = []
     if request is not None:
@@ -1584,9 +1676,20 @@ async def resolve_direct_tool_servers_from_request_and_metadata(
                                 )
             except Exception:
                 request_servers = []
-    if request_servers:
+    if not metadata_has_tool_servers:
         return request_servers
-    return []
+
+    for server, settings in missing_prompts:
+        prompts = [
+            candidate.get("system_prompt")
+            for candidate in request_servers
+            if connection_settings(candidate) == settings
+        ]
+        # Prompt-only recovery is safe once Core approved this exact
+        # connection. Ambiguous duplicate connections stay without a prompt.
+        if prompts and all(isinstance(prompt, str) and prompt == prompts[0] for prompt in prompts):
+            server["system_prompt"] = prompts[0]
+    return servers
 
 
 def build_direct_tools_dict(
@@ -1684,6 +1787,7 @@ async def build_tools_dict(
     excluded_tool_ids,
     resolved_terminal_id=None,
     resolved_direct_tool_servers=None,
+    include_terminal_agents_md=False,
 ):
     """Assemble a tools_dict from regular, MCP, terminal, direct, and
     builtin sources.
@@ -1698,6 +1802,9 @@ async def build_tools_dict(
     them from ``request.body()`` / ``metadata`` itself. Pre-resolving
     avoids re-reading ``request.body()`` when the caller already did
     so for its own bookkeeping.
+
+    ``include_terminal_agents_md`` loads Core's terminal instructions once
+    for callers that construct an internal model conversation.
     """
     import inspect
     import logging
@@ -1722,6 +1829,10 @@ async def build_tools_dict(
     metadata = metadata or {}
     extra_params = extra_params or {}
     model = model or {}
+    terminal_context_enabled = (
+        bool(getattr(valves, "ENABLE_TERMINAL_TOOLS", True))
+        and (model.get("info", {}).get("meta", {}).get("capabilities") or {}).get("terminal", True)
+    )
     tools_dict: dict = {}
     extra_metadata = extra_params.get("__metadata__")
     event_emitter = extra_params.get("__event_emitter__")
@@ -1746,6 +1857,21 @@ async def build_tools_dict(
             extra_params["__metadata__"] = metadata
             extra_metadata = metadata
 
+    is_admin_terminal = True
+    if terminal_id and terminal_context_enabled:
+        try:
+            from open_webui.models.config import Config
+        except ImportError:
+            pass
+        else:
+            terminal_connections = await maybe_await(
+                Config.get("terminal_server.connections", None)
+            )
+            if terminal_connections is not None:
+                is_admin_terminal = terminal_id in {
+                    connection.get("id") for connection in terminal_connections
+                }
+
     if resolved_direct_tool_servers is None:
         direct_tool_servers = await resolve_direct_tool_servers_from_request_and_metadata(
             request=request,
@@ -1762,6 +1888,19 @@ async def build_tools_dict(
         else:
             extra_params["__metadata__"] = metadata
             extra_metadata = metadata
+
+    # Fetch file instructions before opening MCP clients so cancellation during
+    # this network request cannot strand clients not yet returned to the caller.
+    extra_params.pop("__terminal_agents_md__", None)
+    if include_terminal_agents_md and terminal_id and terminal_context_enabled:
+        try:
+            from open_webui.utils.terminals import get_terminal_agents_md
+        except ImportError:
+            get_terminal_agents_md = None
+        if get_terminal_agents_md is not None:
+            agents_md = await get_terminal_agents_md(request, user, metadata, extra_params)
+            if agents_md:
+                extra_params["__terminal_agents_md__"] = agents_md
 
     # Open WebUI's get_tools() silently skips ``server:mcp:`` entries, so
     # split them out and resolve via resolve_mcp_tools().
@@ -1801,219 +1940,260 @@ async def build_tools_dict(
                 content=f"Could not load tools: {e}",
             )
 
-    if mcp_tool_ids:
-        try:
-            mcp_tools, mcp_clients = await resolve_mcp_tools(
-                request=request,
-                user=user,
-                mcp_tool_ids=mcp_tool_ids,
-                extra_params=extra_params,
-                metadata=metadata,
-                debug=debug,
-            )
-            if mcp_tools:
-                duplicate_names = set(tools_dict.keys()) & set(mcp_tools.keys())
-                tools_dict.update(mcp_tools)
-                if debug:
-                    if duplicate_names:
-                        log.warning(
-                            "MCP tools overrode existing tool names: "
-                            f"{sorted(duplicate_names)}"
-                        )
-                    log.info(f"Loaded {len(mcp_tools)} MCP tools")
-        except Exception as e:
-            log.exception(f"Error loading MCP tools: {e}")
-            await emit_notification(
-                event_emitter,
-                level="warning",
-                content=f"Could not load MCP tools: {e}",
-            )
-
-    if terminal_id and bool(getattr(valves, "ENABLE_TERMINAL_TOOLS", True)):
-        if get_terminal_tools is None:
-            if debug:
-                log.info("get_terminal_tools is unavailable in this Open WebUI version")
-        else:
+    try:
+        if mcp_tool_ids:
             try:
-                terminal_tools_result = await get_terminal_tools(
+                mcp_tools, mcp_clients = await resolve_mcp_tools(
                     request=request,
-                    terminal_id=terminal_id,
                     user=user,
+                    mcp_tool_ids=mcp_tool_ids,
                     extra_params=extra_params,
+                    metadata=metadata,
+                    debug=debug,
                 )
-                terminal_tools = normalize_terminal_tools_result(
-                    terminal_tools_result=terminal_tools_result,
-                    extra_params=extra_params,
-                )
-                if terminal_tools:
-                    duplicate_names = set(tools_dict.keys()) & set(terminal_tools.keys())
-                    tools_dict = {**tools_dict, **terminal_tools}
+                if mcp_tools:
+                    duplicate_names = set(tools_dict.keys()) & set(mcp_tools.keys())
+                    tools_dict.update(mcp_tools)
                     if debug:
                         if duplicate_names:
                             log.warning(
-                                "Terminal tools overrode existing tool names: "
+                                "MCP tools overrode existing tool names: "
                                 f"{sorted(duplicate_names)}"
                             )
-                        log.info(
-                            f"Loaded {len(terminal_tools)} terminal tools for terminal_id={terminal_id}"
-                        )
+                        log.info(f"Loaded {len(mcp_tools)} MCP tools")
             except Exception as e:
-                log.exception(f"Error loading terminal tools: {e}")
+                log.exception(f"Error loading MCP tools: {e}")
                 await emit_notification(
                     event_emitter,
                     level="warning",
-                    content=f"Could not load terminal tools: {e}",
+                    content=f"Could not load MCP tools: {e}",
                 )
-    elif terminal_id and debug:
-        log.info("Terminal tools disabled by ENABLE_TERMINAL_TOOLS valve")
 
-    if direct_tool_servers:
-        try:
-            direct_tools = build_direct_tools_dict(
-                tool_servers=direct_tool_servers,
-                debug=debug,
-            )
-            if direct_tools:
-                duplicate_names = set(tools_dict.keys()) & set(direct_tools.keys())
-                tools_dict = {**tools_dict, **direct_tools}
-                direct_tool_server_prompts = extract_direct_tool_server_prompts(direct_tools)
-                if direct_tool_server_prompts:
-                    extra_params["__direct_tool_server_system_prompts__"] = direct_tool_server_prompts
+        if terminal_id and terminal_context_enabled and is_admin_terminal:
+            if get_terminal_tools is None:
+                if debug:
+                    log.info("get_terminal_tools is unavailable in this Open WebUI version")
+            else:
+                try:
+                    terminal_tools_result = await get_terminal_tools(
+                        request=request,
+                        terminal_id=terminal_id,
+                        user=user,
+                        extra_params=extra_params,
+                    )
+                    terminal_tools = normalize_terminal_tools_result(
+                        terminal_tools_result=terminal_tools_result,
+                        extra_params=extra_params,
+                    )
+                    if terminal_tools:
+                        duplicate_names = set(tools_dict.keys()) & set(terminal_tools.keys())
+                        tools_dict = {**tools_dict, **terminal_tools}
+                        if debug:
+                            if duplicate_names:
+                                log.warning(
+                                    "Terminal tools overrode existing tool names: "
+                                    f"{sorted(duplicate_names)}"
+                                )
+                            log.info(
+                                f"Loaded {len(terminal_tools)} terminal tools for terminal_id={terminal_id}"
+                            )
+                except Exception as e:
+                    log.exception(f"Error loading terminal tools: {e}")
+                    await emit_notification(
+                        event_emitter,
+                        level="warning",
+                        content=f"Could not load terminal tools: {e}",
+                    )
+        elif terminal_id and not terminal_context_enabled and debug:
+            log.info("Terminal tools disabled by the plugin valve or model capability")
+
+        if direct_tool_servers:
+            try:
+                direct_tools = build_direct_tools_dict(
+                    tool_servers=[
+                        server for server in direct_tool_servers
+                        if server.get("is_terminal") is not True or terminal_context_enabled
+                    ],
+                    debug=debug,
+                )
+                if direct_tools:
+                    duplicate_names = set(tools_dict.keys()) & set(direct_tools.keys())
+                    tools_dict = {**tools_dict, **direct_tools}
+                    direct_tool_server_prompts = extract_direct_tool_server_prompts(direct_tools)
+                    if direct_tool_server_prompts:
+                        extra_params["__direct_tool_server_system_prompts__"] = direct_tool_server_prompts
+                    else:
+                        extra_params.pop("__direct_tool_server_system_prompts__", None)
+                    if debug:
+                        if duplicate_names:
+                            log.warning(
+                                "Direct tools overrode existing tool names: "
+                                f"{sorted(duplicate_names)}"
+                            )
+                        log.info(f"Loaded {len(direct_tools)} direct tools")
                 else:
                     extra_params.pop("__direct_tool_server_system_prompts__", None)
-                if debug:
-                    if duplicate_names:
-                        log.warning(
-                            "Direct tools overrode existing tool names: "
-                            f"{sorted(duplicate_names)}"
-                        )
-                    log.info(f"Loaded {len(direct_tools)} direct tools")
-            else:
+            except Exception as e:
+                log.exception(f"Error loading direct tools: {e}")
                 extra_params.pop("__direct_tool_server_system_prompts__", None)
-        except Exception as e:
-            log.exception(f"Error loading direct tools: {e}")
+                await emit_notification(
+                    event_emitter,
+                    level="warning",
+                    content=f"Could not load direct tools: {e}",
+                )
+        else:
             extra_params.pop("__direct_tool_server_system_prompts__", None)
+
+        try:
+            features = metadata.get("features", {})
+
+            # NOTE: view_skill is NOT registered here; the plugin registers it
+            # manually via shared.skills.register_view_skill() when the parent
+            # conversation's <available_skills> manifest is detected
+            # (model-attached skills).
+            builtin_extra_params = {
+                "__user__": extra_params.get("__user__"),
+                "__event_emitter__": extra_params.get("__event_emitter__"),
+                "__event_call__": extra_params.get("__event_call__"),
+                "__metadata__": extra_params.get("__metadata__"),
+                "__chat_id__": extra_params.get("__chat_id__"),
+                "__message_id__": extra_params.get("__message_id__"),
+                "__oauth_token__": extra_params.get("__oauth_token__"),
+            }
+
+            builtin_kwargs = {
+                "request": request,
+                "extra_params": builtin_extra_params,
+                "features": features,
+                "model": model,
+            }
+            try:
+                supports_note_chat = (
+                    "is_note_chat" in inspect.signature(get_builtin_tools).parameters
+                )
+            except (TypeError, ValueError):
+                supports_note_chat = False
+            if supports_note_chat:
+                from open_webui.models.chats import Chats
+                from open_webui.utils.chat_id import is_saved_chat_id
+
+                chat_id = metadata.get("chat_id")
+                chat = (
+                    await maybe_await(Chats.get_chat_by_id(chat_id))
+                    if is_saved_chat_id(chat_id)
+                    else None
+                )
+                builtin_kwargs["is_note_chat"] = bool(
+                    chat
+                    and (chat.meta or {}).get("internal") is True
+                    and (chat.meta or {}).get("type") == "note"
+                )
+
+            all_builtin_tools = await maybe_await(get_builtin_tools(**builtin_kwargs))
+
+            # NOTE: ask_user is excluded from nested loops. The callable itself
+            # would work over __event_call__, but the frontend keeps a single
+            # event callback, so concurrent request:user_input calls from
+            # parallel branches clobber each other and the losing call waits
+            # forever (Core overrides sio.call's 60s default timeout with
+            # WEBSOCKET_EVENT_CALLER_TIMEOUT, which defaults to None).
+            disabled_builtin_tools: set = set(
+                BUILTIN_TOOL_CATEGORIES.get("user_input", set())
+            )
+            for valve_field, category in VALVE_TO_CATEGORY.items():
+                if not getattr(valves, valve_field, True):
+                    disabled_builtin_tools.update(BUILTIN_TOOL_CATEGORIES.get(category, set()))
+
+            knowledge_tools_enabled = bool(getattr(valves, "ENABLE_KNOWLEDGE_TOOLS", True))
+            file_tools_enabled = bool(getattr(valves, "ENABLE_FILE_TOOLS", True))
+            notes_tools_enabled = bool(getattr(valves, "ENABLE_NOTES_TOOLS", True))
+            knowledge_metadata = (
+                metadata
+                if core_get_attached_knowledge is not None
+                else {"folder_knowledge": metadata.get("folder_knowledge")}
+            )
+            keep_view_note_for_knowledge = (
+                (not notes_tools_enabled)
+                and knowledge_tools_enabled
+                and model_knowledge_tools_enabled(model)
+                and model_has_note_knowledge(model, knowledge_metadata)
+            )
+            keep_view_file = (
+                file_tools_enabled and "list_chat_files" in all_builtin_tools
+            ) or (
+                knowledge_tools_enabled
+                and model_knowledge_tools_enabled(model)
+                and "kb_exec" not in all_builtin_tools
+                and model_has_file_knowledge(model, knowledge_metadata)
+            )
+
+            # Regular tools take priority over builtin tools with the same name.
+            builtin_count = 0
+            for name, tool_dict in all_builtin_tools.items():
+                if name in disabled_builtin_tools and not (
+                    (name == "view_note" and keep_view_note_for_knowledge)
+                    or (name == "view_file" and keep_view_file)
+                ):
+                    continue
+                if name not in tools_dict:
+                    tools_dict[name] = tool_dict
+                    builtin_count += 1
+                elif debug:
+                    log.warning(
+                        f"Builtin tool '{name}' skipped: "
+                        "regular tool with same name takes priority"
+                    )
+
+            if debug:
+                log.info(
+                    f"Loaded {builtin_count} builtin tools "
+                    f"(disabled categories: {[c for v, c in VALVE_TO_CATEGORY.items() if not getattr(valves, v, True)]}). "
+                    f"Total tools: {len(tools_dict)}"
+                )
+        except Exception as e:
+            log.exception(f"Error loading builtin tools: {e}")
             await emit_notification(
                 event_emitter,
                 level="warning",
-                content=f"Could not load direct tools: {e}",
-            )
-    else:
-        extra_params.pop("__direct_tool_server_system_prompts__", None)
-
-    try:
-        features = metadata.get("features", {})
-
-        # NOTE: view_skill is NOT registered here; the plugin registers it
-        # manually via shared.skills.register_view_skill() when the parent
-        # conversation's <available_skills> manifest is detected
-        # (model-attached skills).
-        builtin_extra_params = {
-            "__user__": extra_params.get("__user__"),
-            "__event_emitter__": extra_params.get("__event_emitter__"),
-            "__event_call__": extra_params.get("__event_call__"),
-            "__metadata__": extra_params.get("__metadata__"),
-            "__chat_id__": extra_params.get("__chat_id__"),
-            "__message_id__": extra_params.get("__message_id__"),
-            "__oauth_token__": extra_params.get("__oauth_token__"),
-        }
-
-        builtin_kwargs = {
-            "request": request,
-            "extra_params": builtin_extra_params,
-            "features": features,
-            "model": model,
-        }
-        try:
-            supports_note_chat = (
-                "is_note_chat" in inspect.signature(get_builtin_tools).parameters
-            )
-        except (TypeError, ValueError):
-            supports_note_chat = False
-        if supports_note_chat:
-            from open_webui.models.chats import Chats
-            from open_webui.utils.chat_id import is_saved_chat_id
-
-            chat_id = metadata.get("chat_id")
-            chat = (
-                await maybe_await(Chats.get_chat_by_id(chat_id))
-                if is_saved_chat_id(chat_id)
-                else None
-            )
-            builtin_kwargs["is_note_chat"] = bool(
-                chat
-                and (chat.meta or {}).get("internal") is True
-                and (chat.meta or {}).get("type") == "note"
+                content=f"Could not load builtin tools: {e}",
             )
 
-        all_builtin_tools = await maybe_await(get_builtin_tools(**builtin_kwargs))
-
-        # NOTE: ask_user is excluded from nested loops. The callable itself
-        # would work over __event_call__, but the frontend keeps a single
-        # event callback, so concurrent request:user_input calls from
-        # parallel branches clobber each other and the losing call waits
-        # forever (Core overrides sio.call's 60s default timeout with
-        # WEBSOCKET_EVENT_CALLER_TIMEOUT, which defaults to None).
-        disabled_builtin_tools: set = set(
-            BUILTIN_TOOL_CATEGORIES.get("user_input", set())
-        )
-        for valve_field, category in VALVE_TO_CATEGORY.items():
-            if not getattr(valves, valve_field, True):
-                disabled_builtin_tools.update(BUILTIN_TOOL_CATEGORIES.get(category, set()))
-
-        knowledge_tools_enabled = bool(getattr(valves, "ENABLE_KNOWLEDGE_TOOLS", True))
-        file_tools_enabled = bool(getattr(valves, "ENABLE_FILE_TOOLS", True))
-        notes_tools_enabled = bool(getattr(valves, "ENABLE_NOTES_TOOLS", True))
-        knowledge_metadata = (
-            metadata
-            if core_get_attached_knowledge is not None
-            else {"folder_knowledge": metadata.get("folder_knowledge")}
-        )
-        keep_view_note_for_knowledge = (
-            (not notes_tools_enabled)
-            and knowledge_tools_enabled
-            and model_knowledge_tools_enabled(model)
-            and model_has_note_knowledge(model, knowledge_metadata)
-        )
-        keep_view_file = (
-            file_tools_enabled and "list_chat_files" in all_builtin_tools
-        ) or (
-            knowledge_tools_enabled
-            and model_knowledge_tools_enabled(model)
-            and "kb_exec" not in all_builtin_tools
-            and model_has_file_knowledge(model, knowledge_metadata)
+        # Core already checked the originating browser's shell connection. Do not
+        # restore shell tools it withheld when rebuilding a nested tool catalogue.
+        parent_tools = metadata.get("tools") or {}
+        inherit_user_shell = (
+            terminal_context_enabled
+            and metadata.get("session_id")
+            and metadata.get("chat_id")
+            and not metadata.get("automation_id")
+            and not metadata.get("internal")
         )
 
-        # Regular tools take priority over builtin tools with the same name.
-        builtin_count = 0
-        for name, tool_dict in all_builtin_tools.items():
-            if name in disabled_builtin_tools and not (
-                (name == "view_note" and keep_view_note_for_knowledge)
-                or (name == "view_file" and keep_view_file)
-            ):
-                continue
-            if name not in tools_dict:
-                tools_dict[name] = tool_dict
-                builtin_count += 1
-            elif debug:
-                log.warning(
-                    f"Builtin tool '{name}' skipped: "
-                    "regular tool with same name takes priority"
+        def is_selected_terminal_tool(tool):
+            return isinstance(tool, dict) and bool(terminal_id) and (
+                (tool.get("type") == "terminal" and tool.get("tool_id") == f"terminal:{terminal_id}")
+                or (
+                    tool.get("direct")
+                    and tool.get("server", {}).get("is_terminal") is True
+                    and tool.get("server", {}).get("url") == terminal_id
                 )
-
-        if debug:
-            log.info(
-                f"Loaded {builtin_count} builtin tools "
-                f"(disabled categories: {[c for v, c in VALVE_TO_CATEGORY.items() if not getattr(valves, v, True)]}). "
-                f"Total tools: {len(tools_dict)}"
             )
-    except Exception as e:
-        log.exception(f"Error loading builtin tools: {e}")
-        await emit_notification(
-            event_emitter,
-            level="warning",
-            content=f"Could not load builtin tools: {e}",
-        )
+
+        for name in ("read_user_terminal", "send_user_terminal_input"):
+            tool = tools_dict.get(name)
+            if tool and (
+                tool.get("type") == "terminal"
+                or tool.get("server", {}).get("is_terminal") is True
+            ):
+                if not (
+                    inherit_user_shell
+                    and is_selected_terminal_tool(tool)
+                    and is_selected_terminal_tool(parent_tools.get(name))
+                ):
+                    tools_dict.pop(name)
+    except BaseException:
+        await cleanup_mcp_clients(mcp_clients)
+        raise
 
     return tools_dict, mcp_clients
 
@@ -4886,6 +5066,7 @@ async def run_agent_loop(
     agent_name: str = "Agent",
     iteration_note_role: Literal["user", "system"] = "user",
     submission_tool_names: Optional[set[str]] = None,
+    filter_pipeline: Optional[dict] = None,
 ) -> str:
     """Run the LLM Review agent tool loop until completion.
 
@@ -4911,12 +5092,13 @@ async def run_agent_loop(
     else:
         user_obj = user
 
-    filter_pipeline = await resolve_model_filter_pipeline(
-        apply_inlet_filters,
-        request,
-        model_id,
-        extra_params.get("__metadata__", {}).get("filter_ids", []),
-    )
+    if filter_pipeline is None:
+        filter_pipeline = await resolve_model_filter_pipeline(
+            apply_inlet_filters,
+            request,
+            model_id,
+            extra_params.get("__metadata__", {}).get("filter_ids", []),
+        )
 
     # Build tools parameter for native function calling
     tools_param = None
@@ -5193,6 +5375,7 @@ async def run_agent_loop(
             # submit_* twice in the same batch, would overwrite the
             # capture payload with whatever came second.
             submission_tool_fired = False
+            tool_images = []
             for tool_call in normalized_tool_calls:
                 tc_func = tool_call.get("function")
                 tool_name = tc_func.get("name", "unknown") if isinstance(tc_func, dict) else "unknown"
@@ -5222,6 +5405,7 @@ async def run_agent_loop(
                 )
 
                 # Emit status with tool result preview
+                tool_images.extend(result.get("images", []))
                 if event_emitter:
                     result_content = result["content"].replace(chr(10), ' ') if result["content"] else "(empty)"
                     await event_emitter(
@@ -5252,6 +5436,8 @@ async def run_agent_loop(
                 # closure; any further LLM round or tool execution here
                 # would be drift past the agent's own completion signal.
                 return content or ""
+
+            append_tool_result_images(current_messages, tool_images)
 
     # Max iterations reached
     if event_emitter:
@@ -5316,9 +5502,10 @@ async def run_agent_loop(
     final_messages = list(current_messages)
     if final_messages and final_messages[-1].get("role") == "user":
         existing = final_messages[-1].get("content", "") or ""
-        merged = (
-            f"{existing}\n\n{final_user_content}" if existing else final_user_content
-        )
+        if isinstance(existing, list):
+            merged = existing + [{"type": "text", "text": final_user_content}]
+        else:
+            merged = f"{existing}\n\n{final_user_content}" if existing else final_user_content
         final_messages[-1] = {**final_messages[-1], "content": merged}
     else:
         final_messages.append({"role": "user", "content": final_user_content})
@@ -6262,10 +6449,9 @@ CRITICAL RULES:
         )
         started_at = asyncio.get_event_loop().time()
 
-        # Cache (tools_dict, terminal_prompt, direct_prompts) per REAL
-        # model_id — not agent_id — so three agents running the same model
-        # share one tool resolution pass instead of triple-building it.
-        tools_cache: dict[str, tuple[dict, Optional[str], list[str]]] = {}
+        # Share tools and terminal/direct prompts per resolved target, while
+        # each logical loop keeps its own Arena choice and filter context.
+        tools_cache: dict[str, tuple[dict, Optional[str], list[str], Optional[str]]] = {}
         all_mcp_clients: list[dict[str, Any]] = []
         rounds_data: list[dict] = []
         # current_drafts: latest body for each agent, updated on every
@@ -6305,15 +6491,14 @@ CRITICAL RULES:
             reset_succeeded_outcomes(per_agent_last_phase_outcome, agent_ids)
 
         async def ensure_tools(
-            agent_id: str,
-        ) -> tuple[dict, Optional[str], list[str]]:
-            real_model_id = agent_model[agent_id]
+            filter_pipeline: dict,
+        ) -> tuple[dict, Optional[str], list[str], Optional[str]]:
+            real_model_id = filter_pipeline["model_id"]
             cached = tools_cache.get(real_model_id)
             if cached is not None:
                 return cached
-            member_model = request.app.state.MODELS.get(real_model_id, {})
-            # build_tools_dict mutates this dict to set __terminal_system_prompt__
-            # and __direct_tool_server_system_prompts__ — keep it captive.
+            member_model = filter_pipeline["model"]
+            # Keep model-specific prompts written by the loader captive.
             scratch_extra_params = {
                 **extra_params,
                 "__model__": member_model,
@@ -6329,15 +6514,11 @@ CRITICAL RULES:
                 excluded_tool_ids=excluded_tool_ids,
                 resolved_terminal_id=resolved_terminal_id,
                 resolved_direct_tool_servers=resolved_direct_tool_servers,
+                include_terminal_agents_md=True,
             )
-            # Track MCP clients before any further await so the outer
-            # finally's cleanup loop sees them even if a downstream await
-            # (register_view_skill) raises or is cancelled.
+            # Track clients before skill setup can fail or be cancelled.
             if mcp_clients:
                 all_mcp_clients.append(mcp_clients)
-            # Manually register view_skill if the parent conversation has a
-            # skills manifest and skills tools are enabled (model-attached
-            # skills only — user-selected skills are inlined elsewhere).
             if (
                 skill_manifest
                 and bool(getattr(self.valves, "ENABLE_SKILLS_TOOLS", True))
@@ -6348,16 +6529,21 @@ CRITICAL RULES:
             direct_prompts = scratch_extra_params.get(
                 "__direct_tool_server_system_prompts__", []
             ) or []
-            cached = (tools_dict, terminal_prompt, list(direct_prompts))
+            cached = (
+                tools_dict,
+                terminal_prompt,
+                list(direct_prompts),
+                scratch_extra_params.get("__terminal_agents_md__"),
+            )
             tools_cache[real_model_id] = cached
             return cached
 
         def make_member_extra_params(
-            agent_id: str,
+            member_model: dict,
             terminal_prompt: Optional[str],
             direct_prompts: list[str],
+            terminal_agents_md: Optional[str],
         ) -> dict:
-            member_model = request.app.state.MODELS.get(agent_model[agent_id], {})
             params = {
                 **extra_params,
                 "__model__": member_model,
@@ -6366,7 +6552,30 @@ CRITICAL RULES:
                 params["__terminal_system_prompt__"] = terminal_prompt
             if direct_prompts:
                 params["__direct_tool_server_system_prompts__"] = list(direct_prompts)
+            if terminal_agents_md:
+                params["__terminal_agents_md__"] = terminal_agents_md
             return params
+
+        async def prepare_member(agent_id: str):
+            # Open MCP sessions in the parent task that owns final cleanup.
+            # Each loop still resolves its own Arena route and filter context.
+            try:
+                filter_pipeline = await resolve_model_filter_pipeline(
+                    self.valves.APPLY_INLET_FILTERS,
+                    request,
+                    agent_model[agent_id],
+                    metadata.get("filter_ids", []),
+                )
+                tools_dict, terminal_prompt, direct_prompts, agents_md = await ensure_tools(
+                    filter_pipeline
+                )
+                member_extra_params = make_member_extra_params(
+                    filter_pipeline["model"], terminal_prompt, direct_prompts, agents_md
+                )
+                return filter_pipeline, tools_dict, member_extra_params
+            except Exception as exc:
+                # Let the member's existing failure/progress handling report it.
+                return exc
 
         try:
             # ---------- Phase 1: Initial Composition ----------
@@ -6382,7 +6591,7 @@ CRITICAL RULES:
             )
             reset_phase_outcomes()
 
-            async def compose_draft(agent_id: str) -> tuple[str, str, dict]:
+            async def compose_draft(agent_id: str, prepared) -> tuple[str, str, dict]:
                 persona = agents[agent_id]
                 # ``state`` stays "failed" unless we actually produce a usable
                 # draft. run_agent_loop returns API/auth/parse errors as
@@ -6396,12 +6605,9 @@ CRITICAL RULES:
                 content: str = ""
                 parsed: Any = {}
                 try:
-                    tools_dict, terminal_prompt, direct_prompts = await ensure_tools(
-                        agent_id
-                    )
-                    member_extra_params = make_member_extra_params(
-                        agent_id, terminal_prompt, direct_prompts
-                    )
+                    if isinstance(prepared, Exception):
+                        raise prepared
+                    filter_pipeline, tools_dict, member_extra_params = prepared
 
                     system_prompt = build_compose_system_prompt(
                         base_system_prompt, persona, include_sources
@@ -6431,7 +6637,7 @@ CRITICAL RULES:
                     content = await run_agent_loop(
                         request=request,
                         user=user,
-                        model_id=agent_model[agent_id],
+                        model_id=filter_pipeline["model_id"],
                         messages=[
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": user_prompt},
@@ -6444,6 +6650,7 @@ CRITICAL RULES:
                         event_emitter=emitter.wrap_agent(agent_id, persona["name"]),
                         iteration_note_role=self.valves.ITERATION_NOTE_ROLE,
                         submission_tool_names={"submit_draft"},
+                        filter_pipeline=filter_pipeline,
                     )
 
                     # Strict tool-call contract: the only authoritative
@@ -6524,8 +6731,9 @@ CRITICAL RULES:
                 finally:
                     await emitter.tick_substep(agent_state={agent_id: state})
 
+            prepared_compose = [(aid, await prepare_member(aid)) for aid in agent_ids]
             compose_results = await asyncio.gather(
-                *[compose_draft(aid) for aid in agent_ids], return_exceptions=True
+                *(compose_draft(*member) for member in prepared_compose), return_exceptions=True
             )
 
             for idx, result in enumerate(compose_results):
@@ -6598,7 +6806,7 @@ CRITICAL RULES:
                 review_counts_lock = asyncio.Lock()
 
                 async def review_draft(
-                    reviewer_id: str, author_id: str
+                    reviewer_id: str, author_id: str, prepared
                 ) -> tuple[str, str, str, dict]:
                     reviewer_persona = agents[reviewer_id]
                     author_persona = agents[author_id]
@@ -6612,12 +6820,9 @@ CRITICAL RULES:
                     content: str = ""
                     parsed: Any = {}
                     try:
-                        _, terminal_prompt, direct_prompts = await ensure_tools(
-                            reviewer_id
-                        )
-                        member_extra_params = make_member_extra_params(
-                            reviewer_id, terminal_prompt, direct_prompts
-                        )
+                        if isinstance(prepared, Exception):
+                            raise prepared
+                        filter_pipeline, _, member_extra_params = prepared
 
                         system_prompt = build_review_system_prompt(
                             base_system_prompt,
@@ -6643,7 +6848,7 @@ CRITICAL RULES:
                         content = await run_agent_loop(
                             request=request,
                             user=user,
-                            model_id=agent_model[reviewer_id],
+                            model_id=filter_pipeline["model_id"],
                             messages=[
                                 {"role": "system", "content": system_prompt},
                                 {"role": "user", "content": user_prompt},
@@ -6659,6 +6864,7 @@ CRITICAL RULES:
                             ),
                             iteration_note_role=self.valves.ITERATION_NOTE_ROLE,
                             submission_tool_names={"submit_review"},
+                            filter_pipeline=filter_pipeline,
                         )
 
                         # Strict tool-call contract: only the capture from
@@ -6703,13 +6909,15 @@ CRITICAL RULES:
                             agent_state={reviewer_id: state_text}
                         )
 
-                review_tasks = [
-                    review_draft(reviewer_id, author_id)
+                prepared_reviews = [
+                    (reviewer_id, author_id, await prepare_member(reviewer_id))
                     for reviewer_id in agent_ids
                     for author_id in agent_ids
                     if reviewer_id != author_id
                 ]
-                review_results = await asyncio.gather(*review_tasks, return_exceptions=True)
+                review_results = await asyncio.gather(
+                    *(review_draft(*member) for member in prepared_reviews), return_exceptions=True
+                )
 
                 for result in review_results:
                     if isinstance(result, BaseException):
@@ -6738,7 +6946,7 @@ CRITICAL RULES:
                 # doesn't leak into THIS round's cancellation labelling.
                 reset_phase_outcomes()
 
-                async def revise_draft(agent_id: str) -> tuple[str, str, dict]:
+                async def revise_draft(agent_id: str, prepared) -> tuple[str, str, dict]:
                     persona = agents[agent_id]
                     original_draft = current_drafts[agent_id]["draft"]
                     feedbacks = list(all_reviews[agent_id].values())
@@ -6750,12 +6958,9 @@ CRITICAL RULES:
                     content: str = ""
                     parsed: Any = {}
                     try:
-                        tools_dict, terminal_prompt, direct_prompts = await ensure_tools(
-                            agent_id
-                        )
-                        member_extra_params = make_member_extra_params(
-                            agent_id, terminal_prompt, direct_prompts
-                        )
+                        if isinstance(prepared, Exception):
+                            raise prepared
+                        filter_pipeline, tools_dict, member_extra_params = prepared
 
                         system_prompt = build_revise_system_prompt(
                             base_system_prompt, persona, include_sources
@@ -6784,7 +6989,7 @@ CRITICAL RULES:
                         content = await run_agent_loop(
                             request=request,
                             user=user,
-                            model_id=agent_model[agent_id],
+                            model_id=filter_pipeline["model_id"],
                             messages=[
                                 {"role": "system", "content": system_prompt},
                                 {"role": "user", "content": user_prompt},
@@ -6797,6 +7002,7 @@ CRITICAL RULES:
                             event_emitter=emitter.wrap_agent(agent_id, persona["name"]),
                             iteration_note_role=self.valves.ITERATION_NOTE_ROLE,
                             submission_tool_names={"submit_draft"},
+                            filter_pipeline=filter_pipeline,
                         )
 
                         # Strict tool-call contract — same rationale as
@@ -6901,8 +7107,9 @@ CRITICAL RULES:
                     finally:
                         await emitter.tick_substep(agent_state={agent_id: state})
 
+                prepared_revisions = [(aid, await prepare_member(aid)) for aid in agent_ids]
                 revise_results = await asyncio.gather(
-                    *[revise_draft(aid) for aid in agent_ids], return_exceptions=True
+                    *(revise_draft(*member) for member in prepared_revisions), return_exceptions=True
                 )
 
                 revised_drafts: dict[str, dict] = {}
@@ -7231,5 +7438,4 @@ CRITICAL RULES:
                 )
             raise
         finally:
-            for mcp_clients in all_mcp_clients:
-                await cleanup_mcp_clients(mcp_clients)
+            await cleanup_mcp_clients(*all_mcp_clients)

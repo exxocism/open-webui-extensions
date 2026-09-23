@@ -1,17 +1,19 @@
-"""Skill manifest / tag extraction shared by ``llm_review`` and ``sub_agent``.
+"""Skill manifest / tag extraction shared by nested agent tools.
 
 Open WebUI's skill subsystem injects two different shapes into the
 parent conversation's system messages depending on how a skill was
 selected:
 
-- **Model-attached** skills are listed in a single
-  ``<available_skills>`` manifest block; their content is loaded
-  lazily by the ``view_skill`` builtin tool.
-- **User-selected** skills (since v0.8.2) are inlined as full
-  ``<skill name="...">...</skill>`` blocks with the content already
-  expanded -- ``view_skill`` is unnecessary for these.
+- **Available skills** are listed in a single ``<available_skills>``
+  manifest block; their content is loaded lazily by ``view_skill``.
+  Core v0.11.4 can include accessible workspace and terminal skills,
+  in addition to model-attached skills.
+- **Inline skills** use full ``<skill name="...">...</skill>`` blocks;
+  ``view_skill`` is unnecessary for their already-expanded content.
+  Older Core versions inline user-selected skills. Core v0.11.4 inlines
+  mentioned skills, or selected skills when builtin tools are unavailable.
 
-The plugins that spawn agent loops (``llm_review`` / ``sub_agent``)
+The plugins that spawn agent loops
 need to read both shapes out of ``__messages__`` so the spawned agent
 inherits the parent's skill context. They also need to register
 ``view_skill`` manually in their own ``tools_dict`` because their
@@ -103,8 +105,8 @@ def extract_skill_manifest(messages: Optional[list]) -> str:
     """Extract the ``<available_skills>`` manifest from the parent
     conversation's system messages.
 
-    Since v0.8.2, only **model-attached** skills appear in this manifest.
-    User-selected skills are injected as full ``<skill>`` tags instead
+    Core can list model-attached, accessible workspace, and terminal skills.
+    Inline skills may also appear as full ``<skill>`` tags
     (see :func:`extract_user_skill_tags`).
 
     Args:
@@ -121,9 +123,8 @@ def extract_user_skill_tags(messages: Optional[list]) -> list[str]:
     """Extract ``<skill name="...">content</skill>`` tags from the parent
     conversation's system messages.
 
-    Since Open WebUI v0.8.2, user-selected skills are injected as individual
-    ``<skill>`` tags with full content (as opposed to the lazy-loading
-    manifest used for model-attached skills).
+    Mentioned skills, or selected skills on older Core / without builtin
+    tools, can appear as ``<skill>`` tags alongside the available manifest.
 
     Args:
         messages: The parent conversation messages (``__messages__``).
@@ -141,13 +142,12 @@ async def register_view_skill(
 ) -> None:
     """Manually register the view_skill builtin tool in tools_dict.
 
-    This is needed for **model-attached** skills whose content is not injected
-    inline.  The agent loop can call ``view_skill`` to lazily load their
+    This is needed for available skills whose content is not injected
+    inline. The agent loop can call ``view_skill`` to lazily load their
     content from the ``<available_skills>`` manifest.
 
-    Since v0.8.2, user-selected skills are injected as full ``<skill>`` tags
-    and do NOT require ``view_skill``; they are passed directly in the system
-    message.
+    Skills already supplied as full ``<skill>`` tags do not require
+    ``view_skill``; they are passed directly in the system message.
 
     Args:
         tools_dict: The tools dict to add view_skill to (modified in-place).

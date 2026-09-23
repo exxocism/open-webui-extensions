@@ -1,7 +1,7 @@
 """
 title: MAGI decision support
 author: https://github.com/skyzi000
-version: 0.2.15
+version: 0.2.16
 license: MIT
 required_open_webui_version: 0.7.0
 
@@ -43,6 +43,7 @@ from owui_ext.shared.skills import (
     register_view_skill,
 )
 from owui_ext.shared.tool_execution import (
+    append_tool_result_images,
     execute_direct_tool_call,
     execute_tool_call,
     process_tool_result,
@@ -261,6 +262,7 @@ async def run_agent_loop(
     apply_inlet_filters: bool,
     agent_name: str = "Agent",
     event_emitter: Optional[Callable] = None,
+    filter_pipeline: Optional[dict] = None,
 ) -> str:
     from open_webui.models.users import UserModel
     from open_webui.utils.chat import generate_chat_completion
@@ -274,12 +276,13 @@ async def run_agent_loop(
     else:
         user_obj = user
 
-    filter_pipeline = await resolve_model_filter_pipeline(
-        apply_inlet_filters,
-        request,
-        model_id,
-        extra_params.get("__metadata__", {}).get("filter_ids", []),
-    )
+    if filter_pipeline is None:
+        filter_pipeline = await resolve_model_filter_pipeline(
+            apply_inlet_filters,
+            request,
+            model_id,
+            extra_params.get("__metadata__", {}).get("filter_ids", []),
+        )
 
     tools_param = None
     if tools_dict:
@@ -405,6 +408,7 @@ async def run_agent_loop(
                 }
             )
 
+            tool_images = []
             for tool_call in tool_calls:
                 tool_name = tool_call.get("function", {}).get("name", "unknown")
                 tool_args_raw = tool_call.get("function", {}).get("arguments", "{}")
@@ -437,6 +441,7 @@ async def run_agent_loop(
                 )
 
                 # Emit status with tool result preview
+                tool_images.extend(result.get("images", []))
                 if event_emitter:
                     result_preview = (result["content"] or "(empty)").replace(chr(10), ' ')[:80]
                     await event_emitter(
@@ -456,6 +461,8 @@ async def run_agent_loop(
                         "content": result["content"],
                     }
                 )
+
+            append_tool_result_images(current_messages, tool_images)
 
     # Max iterations reached
     if event_emitter:
@@ -729,24 +736,11 @@ class Tools:
                 ensure_ascii=False,
             )
 
-        # Keep tool loading and injected __model__ aligned with the actual
-        # model used for MAGI completions when DEFAULT_MODEL overrides the
-        # parent chat model.
-        resolved_model = __model__ or {}
-        if model_id and model_id != resolved_model.get("id", ""):
-            try:
-                resolved_model = __request__.app.state.MODELS.get(
-                    model_id, resolved_model
-                )
-            except Exception:
-                pass  # Fall back to parent model metadata.
-
         extra_params = {
             "__user__": __user__,
             "__event_emitter__": __event_emitter__,
             "__event_call__": __event_call__,
             "__request__": __request__,
-            "__model__": resolved_model,
             "__metadata__": __metadata__ or {},
             "__chat_id__": __chat_id__,
             "__message_id__": __message_id__,
@@ -769,90 +763,129 @@ class Tools:
         skill_manifest = extract_skill_manifest(__messages__) if skills_enabled else ""
         user_skill_tags = extract_user_skill_tags(__messages__) if skills_enabled else []
 
-        tools_dict, mcp_clients = await build_tools_dict(
-            request=__request__,
-            model=resolved_model,
-            metadata=__metadata__ or {},
-            user=user,
-            valves=self.valves,
-            extra_params=extra_params,
-            tool_id_list=tool_id_list,
-            excluded_tool_ids=excluded_tool_ids,
-        )
+        roles = [
+            ("MELCHIOR", "scientific/technical"),
+            ("BALTHASAR", "legal/ethical"),
+            ("CASPER", "emotional/trend"),
+        ]
 
-        # MCP clients are live as soon as build_tools_dict returns; the
-        # try/finally has to start *here* so an exception or cancellation in
-        # the status emit / setup steps below still triggers cleanup.
-        try:
+        agent_results: Dict[str, dict] = {}
+        raw_outputs: Dict[str, str] = {}
+
+        import asyncio
+
+        # Share tools and loaded context per effective model while each role
+        # keeps its own Arena selection and filter pipeline.
+        tools_cache: dict[str, tuple[dict, dict]] = {}
+        all_mcp_clients: list[dict] = []
+
+        async def ensure_tools(filter_pipeline: dict):
+            effective_model_id = filter_pipeline["model_id"]
+            cached = tools_cache.get(effective_model_id)
+            if cached is not None:
+                return cached
+            loader_extra_params = {
+                **extra_params,
+                "__model__": filter_pipeline["model"],
+                "__metadata__": dict(extra_params["__metadata__"]),
+            }
+            tools_dict, mcp_clients = await build_tools_dict(
+                request=__request__,
+                model=filter_pipeline["model"],
+                metadata=loader_extra_params["__metadata__"],
+                user=user,
+                valves=self.valves,
+                extra_params=loader_extra_params,
+                tool_id_list=tool_id_list,
+                excluded_tool_ids=excluded_tool_ids,
+                include_terminal_agents_md=True,
+            )
+            # Record live clients before skill setup can fail or be cancelled.
+            if mcp_clients:
+                all_mcp_clients.append(mcp_clients)
             if skills_enabled and skill_manifest:
-                await register_view_skill(tools_dict, __request__, extra_params)
+                await register_view_skill(tools_dict, __request__, loader_extra_params)
+            cached = (tools_dict, loader_extra_params)
+            tools_cache[effective_model_id] = cached
+            return cached
 
-            roles = [
-                ("MELCHIOR", "scientific/technical"),
-                ("BALTHASAR", "legal/ethical"),
-                ("CASPER", "emotional/trend"),
-            ]
+        async def run_single_agent(
+            role_name: str, perspective: str, filter_pipeline: dict, loaded_tools: tuple
+        ) -> Tuple[str, str, dict]:
+            """Run a single MAGI agent and return (role_name, raw_output, parsed_result)."""
+            tools_dict, loaded_extra_params = loaded_tools
+            agent_extra_params = {
+                **loaded_extra_params,
+                "__model__": filter_pipeline["model"],
+                "__metadata__": dict(loaded_extra_params["__metadata__"]),
+            }
 
-            agent_results: Dict[str, dict] = {}
-            raw_outputs: Dict[str, str] = {}
+            base_system_prompt, user_prompt = build_agent_prompts(
+                role_name=role_name,
+                perspective=perspective,
+                proposition=prop,
+                prerequisites=prereq,
+                option_a=opt_a,
+                option_b=opt_b,
+                include_sources=include_sources,
+            )
+            if skills_enabled and (user_skill_tags or skill_manifest):
+                system_prompt = merge_prompt_sections(
+                    base_system_prompt,
+                    *user_skill_tags,
+                    skill_manifest,
+                )
+            else:
+                system_prompt = base_system_prompt
+            content = await run_agent_loop(
+                request=__request__,
+                user=user,
+                model_id=model_id,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                tools_dict=tools_dict,
+                max_iterations=self.valves.MAX_ITERATIONS,
+                extra_params=agent_extra_params,
+                apply_inlet_filters=self.valves.APPLY_INLET_FILTERS,
+                filter_pipeline=filter_pipeline,
+                agent_name=role_name,
+                event_emitter=__event_emitter__,
+            )
 
+            parsed = safe_json_loads(content) or {
+                "vote": "abstain",
+                "reasoning": content,
+                "benefits": [],
+                "risks": [],
+                "sources": [],
+            }
+            return role_name, content, parsed
+
+        try:
+            # MCP sessions must be opened and closed by this same parent task.
+            prepared_agents = []
+            for role_name, perspective in roles:
+                filter_pipeline = await resolve_model_filter_pipeline(
+                    self.valves.APPLY_INLET_FILTERS,
+                    __request__,
+                    model_id,
+                    extra_params["__metadata__"].get("filter_ids", []),
+                )
+                loaded_tools = await ensure_tools(filter_pipeline)
+                prepared_agents.append((role_name, perspective, filter_pipeline, loaded_tools))
             await emitter.emit(
                 description=f"MAGI Starting: {prop}",
                 status="agents_starting",
                 done=False,
             )
-
-            async def run_single_agent(role_name: str, perspective: str) -> Tuple[str, str, dict]:
-                """Run a single MAGI agent and return (role_name, raw_output, parsed_result)."""
-                base_system_prompt, user_prompt = build_agent_prompts(
-                    role_name=role_name,
-                    perspective=perspective,
-                    proposition=prop,
-                    prerequisites=prereq,
-                    option_a=opt_a,
-                    option_b=opt_b,
-                    include_sources=include_sources,
-                )
-                if skills_enabled and (user_skill_tags or skill_manifest):
-                    system_prompt = merge_prompt_sections(
-                        base_system_prompt,
-                        *user_skill_tags,
-                        skill_manifest,
-                    )
-                else:
-                    system_prompt = base_system_prompt
-                content = await run_agent_loop(
-                    request=__request__,
-                    user=user,
-                    model_id=model_id,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    tools_dict=tools_dict,
-                    max_iterations=self.valves.MAX_ITERATIONS,
-                    extra_params=extra_params,
-                    apply_inlet_filters=self.valves.APPLY_INLET_FILTERS,
-                    agent_name=role_name,
-                    event_emitter=__event_emitter__,
-                )
-
-                parsed = safe_json_loads(content) or {
-                    "vote": "abstain",
-                    "reasoning": content,
-                    "benefits": [],
-                    "risks": [],
-                    "sources": [],
-                }
-                return role_name, content, parsed
-
-            import asyncio
-
-            agent_tasks = [run_single_agent(role_name, perspective) for role_name, perspective in roles]
-            results = await asyncio.gather(*agent_tasks, return_exceptions=True)
+            results = await asyncio.gather(
+                *(run_single_agent(*prepared) for prepared in prepared_agents),
+                return_exceptions=True,
+            )
         finally:
-            if mcp_clients:
-                await cleanup_mcp_clients(mcp_clients)
+            await cleanup_mcp_clients(*all_mcp_clients)
 
         for result in results:
             if isinstance(result, Exception):

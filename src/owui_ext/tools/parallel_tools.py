@@ -1,7 +1,7 @@
 """
 title: Parallel Tools
 author: skyzi000
-version: 0.2.5
+version: 0.2.6
 license: MIT
 required_open_webui_version: 0.7.0
 description: Execute multiple independent tool calls in parallel for faster results.
@@ -31,6 +31,7 @@ from owui_ext.shared.tool_execution import (
     emit_terminal_tool_event,
     execute_direct_tool_call,
     process_tool_result,
+    split_tool_result_files,
     structure_terminal_file_tool_result,
 )
 from owui_ext.shared.mcp_tools import cleanup_mcp_clients
@@ -134,6 +135,13 @@ async def execute_single_tool(
             metadata=extra_params.get("__metadata__"),
             user=extra_params.get("__user__"),
         )
+        tool_result_images = []
+        if tool_result_files:
+            from open_webui.utils import middleware
+
+            # Only Parallel needs Core to extract images from its return container.
+            if callable(getattr(middleware, "extract_base64_images", None)):
+                tool_result_images, tool_result_files = split_tool_result_files(tool_result_files)
 
         # Emit terminal:* events for display/refresh behavior in UI
         await emit_terminal_tool_event(
@@ -183,6 +191,7 @@ async def execute_single_tool(
         return {
             "tool_name": tool_name,
             "result": result,
+            **({"images": tool_result_images} if tool_result_images else {}),
             **({"files": tool_result_files} if tool_result_files else {}),
             **(
                 {
@@ -263,7 +272,7 @@ class Tools:
         __message_id__: str = None,
         __oauth_token__: Optional[dict] = None,
         __messages__: Optional[List[dict]] = None,
-    ) -> str:
+    ) -> str | dict:
         """
         Execute multiple independent tool calls in parallel.
 
@@ -432,6 +441,16 @@ class Tools:
             return json.dumps({"error": f"Failed to load tools: {e}"})
 
         try:
+            # Core's resolved skills are not part of metadata.skill_ids on
+            # newer versions. Reuse the builtin already allowed in this chat.
+            parent_view_skill = (__metadata__.get("tools") or {}).get("view_skill")
+            if (
+                isinstance(parent_view_skill, dict)
+                and parent_view_skill.get("type") == "builtin"
+                and parent_view_skill.get("tool_id") == "builtin:view_skill"
+            ):
+                tools_dict.setdefault("view_skill", parent_view_skill)
+
             if self.valves.DEBUG:
                 log.info(f"[ParallelTools] Total tools available: {len(tools_dict)}")
 
@@ -493,9 +512,21 @@ class Tools:
                     {"type": "embeds", "data": {"embeds": aggregated_embeds}}
                 )
 
-            return json.dumps(
-                {"results": processed_results},
-                ensure_ascii=False,
-            )
+            payload = {"results": processed_results}
+            # Core extracts data-image values from containers, not JSON strings.
+            if any(result.get("images") for result in processed_results if isinstance(result, dict)):
+                from open_webui.utils.middleware import extract_base64_images
+
+                for result in processed_results:
+                    if not isinstance(result, dict):
+                        continue
+                    embedded_images = []
+                    extract_base64_images(result.get("result"), embedded_images)
+                    if embedded_images:
+                        # JSON parsing must not promote another tool's text
+                        # into extra images when Core processes this batch.
+                        result["result"] = json.dumps(result["result"], ensure_ascii=False)
+                return payload
+            return json.dumps(payload, ensure_ascii=False)
         finally:
             await cleanup_mcp_clients(mcp_clients)

@@ -2,7 +2,7 @@
 title: LLM Review
 description: Run a collaborative writing process where multiple persona agents each produce a distinct, original draft — drafting independently, reviewing peers, and revising their own draft across multiple rounds. Returns one divergent draft per persona rather than a merged output. Independent implementation inspired by arXiv:2601.08003 "LLM Review".
 author: https://github.com/skyzi000
-version: 0.5.9
+version: 0.5.10
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -38,6 +38,7 @@ from owui_ext.shared.prompt_utils import (
     truncate_text,
 )
 from owui_ext.shared.tool_execution import (
+    append_tool_result_images,
     execute_direct_tool_call,
     execute_tool_call,
     normalize_terminal_tools_result,
@@ -2905,6 +2906,7 @@ async def run_agent_loop(
     agent_name: str = "Agent",
     iteration_note_role: Literal["user", "system"] = "user",
     submission_tool_names: Optional[set[str]] = None,
+    filter_pipeline: Optional[dict] = None,
 ) -> str:
     """Run the LLM Review agent tool loop until completion.
 
@@ -2930,12 +2932,13 @@ async def run_agent_loop(
     else:
         user_obj = user
 
-    filter_pipeline = await resolve_model_filter_pipeline(
-        apply_inlet_filters,
-        request,
-        model_id,
-        extra_params.get("__metadata__", {}).get("filter_ids", []),
-    )
+    if filter_pipeline is None:
+        filter_pipeline = await resolve_model_filter_pipeline(
+            apply_inlet_filters,
+            request,
+            model_id,
+            extra_params.get("__metadata__", {}).get("filter_ids", []),
+        )
 
     # Build tools parameter for native function calling
     tools_param = None
@@ -3212,6 +3215,7 @@ async def run_agent_loop(
             # submit_* twice in the same batch, would overwrite the
             # capture payload with whatever came second.
             submission_tool_fired = False
+            tool_images = []
             for tool_call in normalized_tool_calls:
                 tc_func = tool_call.get("function")
                 tool_name = tc_func.get("name", "unknown") if isinstance(tc_func, dict) else "unknown"
@@ -3241,6 +3245,7 @@ async def run_agent_loop(
                 )
 
                 # Emit status with tool result preview
+                tool_images.extend(result.get("images", []))
                 if event_emitter:
                     result_content = result["content"].replace(chr(10), ' ') if result["content"] else "(empty)"
                     await event_emitter(
@@ -3271,6 +3276,8 @@ async def run_agent_loop(
                 # closure; any further LLM round or tool execution here
                 # would be drift past the agent's own completion signal.
                 return content or ""
+
+            append_tool_result_images(current_messages, tool_images)
 
     # Max iterations reached
     if event_emitter:
@@ -3335,9 +3342,10 @@ async def run_agent_loop(
     final_messages = list(current_messages)
     if final_messages and final_messages[-1].get("role") == "user":
         existing = final_messages[-1].get("content", "") or ""
-        merged = (
-            f"{existing}\n\n{final_user_content}" if existing else final_user_content
-        )
+        if isinstance(existing, list):
+            merged = existing + [{"type": "text", "text": final_user_content}]
+        else:
+            merged = f"{existing}\n\n{final_user_content}" if existing else final_user_content
         final_messages[-1] = {**final_messages[-1], "content": merged}
     else:
         final_messages.append({"role": "user", "content": final_user_content})
@@ -4281,10 +4289,9 @@ CRITICAL RULES:
         )
         started_at = asyncio.get_event_loop().time()
 
-        # Cache (tools_dict, terminal_prompt, direct_prompts) per REAL
-        # model_id — not agent_id — so three agents running the same model
-        # share one tool resolution pass instead of triple-building it.
-        tools_cache: dict[str, tuple[dict, Optional[str], list[str]]] = {}
+        # Share tools and terminal/direct prompts per resolved target, while
+        # each logical loop keeps its own Arena choice and filter context.
+        tools_cache: dict[str, tuple[dict, Optional[str], list[str], Optional[str]]] = {}
         all_mcp_clients: list[dict[str, Any]] = []
         rounds_data: list[dict] = []
         # current_drafts: latest body for each agent, updated on every
@@ -4324,15 +4331,14 @@ CRITICAL RULES:
             reset_succeeded_outcomes(per_agent_last_phase_outcome, agent_ids)
 
         async def ensure_tools(
-            agent_id: str,
-        ) -> tuple[dict, Optional[str], list[str]]:
-            real_model_id = agent_model[agent_id]
+            filter_pipeline: dict,
+        ) -> tuple[dict, Optional[str], list[str], Optional[str]]:
+            real_model_id = filter_pipeline["model_id"]
             cached = tools_cache.get(real_model_id)
             if cached is not None:
                 return cached
-            member_model = request.app.state.MODELS.get(real_model_id, {})
-            # build_tools_dict mutates this dict to set __terminal_system_prompt__
-            # and __direct_tool_server_system_prompts__ — keep it captive.
+            member_model = filter_pipeline["model"]
+            # Keep model-specific prompts written by the loader captive.
             scratch_extra_params = {
                 **extra_params,
                 "__model__": member_model,
@@ -4348,15 +4354,11 @@ CRITICAL RULES:
                 excluded_tool_ids=excluded_tool_ids,
                 resolved_terminal_id=resolved_terminal_id,
                 resolved_direct_tool_servers=resolved_direct_tool_servers,
+                include_terminal_agents_md=True,
             )
-            # Track MCP clients before any further await so the outer
-            # finally's cleanup loop sees them even if a downstream await
-            # (register_view_skill) raises or is cancelled.
+            # Track clients before skill setup can fail or be cancelled.
             if mcp_clients:
                 all_mcp_clients.append(mcp_clients)
-            # Manually register view_skill if the parent conversation has a
-            # skills manifest and skills tools are enabled (model-attached
-            # skills only — user-selected skills are inlined elsewhere).
             if (
                 skill_manifest
                 and bool(getattr(self.valves, "ENABLE_SKILLS_TOOLS", True))
@@ -4367,16 +4369,21 @@ CRITICAL RULES:
             direct_prompts = scratch_extra_params.get(
                 "__direct_tool_server_system_prompts__", []
             ) or []
-            cached = (tools_dict, terminal_prompt, list(direct_prompts))
+            cached = (
+                tools_dict,
+                terminal_prompt,
+                list(direct_prompts),
+                scratch_extra_params.get("__terminal_agents_md__"),
+            )
             tools_cache[real_model_id] = cached
             return cached
 
         def make_member_extra_params(
-            agent_id: str,
+            member_model: dict,
             terminal_prompt: Optional[str],
             direct_prompts: list[str],
+            terminal_agents_md: Optional[str],
         ) -> dict:
-            member_model = request.app.state.MODELS.get(agent_model[agent_id], {})
             params = {
                 **extra_params,
                 "__model__": member_model,
@@ -4385,7 +4392,30 @@ CRITICAL RULES:
                 params["__terminal_system_prompt__"] = terminal_prompt
             if direct_prompts:
                 params["__direct_tool_server_system_prompts__"] = list(direct_prompts)
+            if terminal_agents_md:
+                params["__terminal_agents_md__"] = terminal_agents_md
             return params
+
+        async def prepare_member(agent_id: str):
+            # Open MCP sessions in the parent task that owns final cleanup.
+            # Each loop still resolves its own Arena route and filter context.
+            try:
+                filter_pipeline = await resolve_model_filter_pipeline(
+                    self.valves.APPLY_INLET_FILTERS,
+                    request,
+                    agent_model[agent_id],
+                    metadata.get("filter_ids", []),
+                )
+                tools_dict, terminal_prompt, direct_prompts, agents_md = await ensure_tools(
+                    filter_pipeline
+                )
+                member_extra_params = make_member_extra_params(
+                    filter_pipeline["model"], terminal_prompt, direct_prompts, agents_md
+                )
+                return filter_pipeline, tools_dict, member_extra_params
+            except Exception as exc:
+                # Let the member's existing failure/progress handling report it.
+                return exc
 
         try:
             # ---------- Phase 1: Initial Composition ----------
@@ -4401,7 +4431,7 @@ CRITICAL RULES:
             )
             reset_phase_outcomes()
 
-            async def compose_draft(agent_id: str) -> tuple[str, str, dict]:
+            async def compose_draft(agent_id: str, prepared) -> tuple[str, str, dict]:
                 persona = agents[agent_id]
                 # ``state`` stays "failed" unless we actually produce a usable
                 # draft. run_agent_loop returns API/auth/parse errors as
@@ -4415,12 +4445,9 @@ CRITICAL RULES:
                 content: str = ""
                 parsed: Any = {}
                 try:
-                    tools_dict, terminal_prompt, direct_prompts = await ensure_tools(
-                        agent_id
-                    )
-                    member_extra_params = make_member_extra_params(
-                        agent_id, terminal_prompt, direct_prompts
-                    )
+                    if isinstance(prepared, Exception):
+                        raise prepared
+                    filter_pipeline, tools_dict, member_extra_params = prepared
 
                     system_prompt = build_compose_system_prompt(
                         base_system_prompt, persona, include_sources
@@ -4450,7 +4477,7 @@ CRITICAL RULES:
                     content = await run_agent_loop(
                         request=request,
                         user=user,
-                        model_id=agent_model[agent_id],
+                        model_id=filter_pipeline["model_id"],
                         messages=[
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": user_prompt},
@@ -4463,6 +4490,7 @@ CRITICAL RULES:
                         event_emitter=emitter.wrap_agent(agent_id, persona["name"]),
                         iteration_note_role=self.valves.ITERATION_NOTE_ROLE,
                         submission_tool_names={"submit_draft"},
+                        filter_pipeline=filter_pipeline,
                     )
 
                     # Strict tool-call contract: the only authoritative
@@ -4543,8 +4571,9 @@ CRITICAL RULES:
                 finally:
                     await emitter.tick_substep(agent_state={agent_id: state})
 
+            prepared_compose = [(aid, await prepare_member(aid)) for aid in agent_ids]
             compose_results = await asyncio.gather(
-                *[compose_draft(aid) for aid in agent_ids], return_exceptions=True
+                *(compose_draft(*member) for member in prepared_compose), return_exceptions=True
             )
 
             for idx, result in enumerate(compose_results):
@@ -4617,7 +4646,7 @@ CRITICAL RULES:
                 review_counts_lock = asyncio.Lock()
 
                 async def review_draft(
-                    reviewer_id: str, author_id: str
+                    reviewer_id: str, author_id: str, prepared
                 ) -> tuple[str, str, str, dict]:
                     reviewer_persona = agents[reviewer_id]
                     author_persona = agents[author_id]
@@ -4631,12 +4660,9 @@ CRITICAL RULES:
                     content: str = ""
                     parsed: Any = {}
                     try:
-                        _, terminal_prompt, direct_prompts = await ensure_tools(
-                            reviewer_id
-                        )
-                        member_extra_params = make_member_extra_params(
-                            reviewer_id, terminal_prompt, direct_prompts
-                        )
+                        if isinstance(prepared, Exception):
+                            raise prepared
+                        filter_pipeline, _, member_extra_params = prepared
 
                         system_prompt = build_review_system_prompt(
                             base_system_prompt,
@@ -4662,7 +4688,7 @@ CRITICAL RULES:
                         content = await run_agent_loop(
                             request=request,
                             user=user,
-                            model_id=agent_model[reviewer_id],
+                            model_id=filter_pipeline["model_id"],
                             messages=[
                                 {"role": "system", "content": system_prompt},
                                 {"role": "user", "content": user_prompt},
@@ -4678,6 +4704,7 @@ CRITICAL RULES:
                             ),
                             iteration_note_role=self.valves.ITERATION_NOTE_ROLE,
                             submission_tool_names={"submit_review"},
+                            filter_pipeline=filter_pipeline,
                         )
 
                         # Strict tool-call contract: only the capture from
@@ -4722,13 +4749,15 @@ CRITICAL RULES:
                             agent_state={reviewer_id: state_text}
                         )
 
-                review_tasks = [
-                    review_draft(reviewer_id, author_id)
+                prepared_reviews = [
+                    (reviewer_id, author_id, await prepare_member(reviewer_id))
                     for reviewer_id in agent_ids
                     for author_id in agent_ids
                     if reviewer_id != author_id
                 ]
-                review_results = await asyncio.gather(*review_tasks, return_exceptions=True)
+                review_results = await asyncio.gather(
+                    *(review_draft(*member) for member in prepared_reviews), return_exceptions=True
+                )
 
                 for result in review_results:
                     if isinstance(result, BaseException):
@@ -4757,7 +4786,7 @@ CRITICAL RULES:
                 # doesn't leak into THIS round's cancellation labelling.
                 reset_phase_outcomes()
 
-                async def revise_draft(agent_id: str) -> tuple[str, str, dict]:
+                async def revise_draft(agent_id: str, prepared) -> tuple[str, str, dict]:
                     persona = agents[agent_id]
                     original_draft = current_drafts[agent_id]["draft"]
                     feedbacks = list(all_reviews[agent_id].values())
@@ -4769,12 +4798,9 @@ CRITICAL RULES:
                     content: str = ""
                     parsed: Any = {}
                     try:
-                        tools_dict, terminal_prompt, direct_prompts = await ensure_tools(
-                            agent_id
-                        )
-                        member_extra_params = make_member_extra_params(
-                            agent_id, terminal_prompt, direct_prompts
-                        )
+                        if isinstance(prepared, Exception):
+                            raise prepared
+                        filter_pipeline, tools_dict, member_extra_params = prepared
 
                         system_prompt = build_revise_system_prompt(
                             base_system_prompt, persona, include_sources
@@ -4803,7 +4829,7 @@ CRITICAL RULES:
                         content = await run_agent_loop(
                             request=request,
                             user=user,
-                            model_id=agent_model[agent_id],
+                            model_id=filter_pipeline["model_id"],
                             messages=[
                                 {"role": "system", "content": system_prompt},
                                 {"role": "user", "content": user_prompt},
@@ -4816,6 +4842,7 @@ CRITICAL RULES:
                             event_emitter=emitter.wrap_agent(agent_id, persona["name"]),
                             iteration_note_role=self.valves.ITERATION_NOTE_ROLE,
                             submission_tool_names={"submit_draft"},
+                            filter_pipeline=filter_pipeline,
                         )
 
                         # Strict tool-call contract — same rationale as
@@ -4920,8 +4947,9 @@ CRITICAL RULES:
                     finally:
                         await emitter.tick_substep(agent_state={agent_id: state})
 
+                prepared_revisions = [(aid, await prepare_member(aid)) for aid in agent_ids]
                 revise_results = await asyncio.gather(
-                    *[revise_draft(aid) for aid in agent_ids], return_exceptions=True
+                    *(revise_draft(*member) for member in prepared_revisions), return_exceptions=True
                 )
 
                 revised_drafts: dict[str, dict] = {}
@@ -5250,5 +5278,4 @@ CRITICAL RULES:
                 )
             raise
         finally:
-            for mcp_clients in all_mcp_clients:
-                await cleanup_mcp_clients(mcp_clients)
+            await cleanup_mcp_clients(*all_mcp_clients)

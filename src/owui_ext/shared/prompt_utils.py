@@ -24,7 +24,7 @@ def truncate_text(value: str, limit: int = 200) -> str:
 
 
 def _append_tool_server_prompts(form_data: dict, extra_params: dict) -> dict:
-    """Append terminal/direct-tool-server system prompts to messages.
+    """Add terminal instructions and tool-server prompts to a request snapshot.
 
     Open WebUI core injects these prompts AFTER inlet filters so they survive
     filters that rewrite the system message.  We replicate the same ordering by
@@ -39,11 +39,14 @@ def _append_tool_server_prompts(form_data: dict, extra_params: dict) -> dict:
     )
     if isinstance(direct_prompts, list):
         prompts.extend(p for p in direct_prompts if isinstance(p, str) and p.strip())
-    if not prompts:
+    agents_md = (extra_params or {}).get("__terminal_agents_md__")
+    if not isinstance(agents_md, str):
+        agents_md = ""
+    if not prompts and not agents_md:
         return form_data
     messages = list(form_data.get("messages", []))
     combined = "\n\n".join(prompts)
-    if messages and messages[0].get("role") == "system":
+    if combined and messages and messages[0].get("role") == "system":
         msg = {**messages[0]}
         content = msg.get("content", "")
         if isinstance(content, list):
@@ -58,7 +61,17 @@ def _append_tool_server_prompts(form_data: dict, extra_params: dict) -> dict:
         else:
             msg["content"] = f"{content}\n\n{combined}" if content else combined
         messages[0] = msg
-    else:
+    elif combined:
         messages.insert(0, {"role": "system", "content": combined})
+    if agents_md and not any(
+        message.get("role") == "user" and message.get("content") == agents_md
+        for message in messages
+    ):
+        try:
+            from open_webui.utils.terminals import add_terminal_agents_md
+        except ImportError:
+            pass  # Older Core versions do not support terminal AGENTS.md.
+        else:
+            messages = add_terminal_agents_md(messages, agents_md)
     form_data["messages"] = messages
     return form_data

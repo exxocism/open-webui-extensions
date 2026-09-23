@@ -2,7 +2,7 @@
 title: Multi Model Council
 description: Run a multi-model council decision with majority vote. Each council member operates independently, can use tools (web search, knowledge bases, etc.) for analysis, and returns their vote with reasoning.
 author: https://github.com/skyzi000
-version: 0.1.22
+version: 0.1.23
 license: MIT
 required_open_webui_version: 0.7.0
 """
@@ -36,6 +36,7 @@ from owui_ext.shared.skills import (
     register_view_skill,
 )
 from owui_ext.shared.tool_execution import (
+    append_tool_result_images,
     execute_direct_tool_call,
     execute_tool_call,
     process_tool_result,
@@ -186,6 +187,7 @@ async def run_agent_loop(
     apply_inlet_filters: bool,
     agent_name: str = "Agent",
     event_emitter: Optional[Callable] = None,
+    filter_pipeline: Optional[dict] = None,
 ) -> str:
     from open_webui.models.users import UserModel
     from open_webui.utils.chat import generate_chat_completion
@@ -199,12 +201,13 @@ async def run_agent_loop(
     else:
         user_obj = user
 
-    filter_pipeline = await resolve_model_filter_pipeline(
-        apply_inlet_filters,
-        request,
-        model_id,
-        extra_params.get("__metadata__", {}).get("filter_ids", []),
-    )
+    if filter_pipeline is None:
+        filter_pipeline = await resolve_model_filter_pipeline(
+            apply_inlet_filters,
+            request,
+            model_id,
+            extra_params.get("__metadata__", {}).get("filter_ids", []),
+        )
 
     tools_param = None
     if tools_dict:
@@ -339,6 +342,7 @@ async def run_agent_loop(
                 }
             )
 
+            tool_images = []
             for tool_call in tool_calls:
                 tool_name = tool_call.get("function", {}).get("name", "unknown")
                 tool_args_raw = tool_call.get("function", {}).get("arguments", "{}")
@@ -371,6 +375,7 @@ async def run_agent_loop(
                 )
 
                 # Emit status with tool result preview
+                tool_images.extend(result.get("images", []))
                 if event_emitter:
                     result_preview = (result["content"] or "(empty)").replace(chr(10), " ")[:80]
                     await event_emitter(
@@ -390,6 +395,8 @@ async def run_agent_loop(
                         "content": result["content"],
                     }
                 )
+
+            append_tool_result_images(current_messages, tool_images)
 
     # Max iterations reached
     if event_emitter:
@@ -902,54 +909,56 @@ CRITICAL RULES:
             done=False,
         )
 
-        # Cache tuple of (tools_dict, mcp_clients) per member model so the
-        # builtin tool catalogue is computed once per distinct model. MCP
-        # clients live alongside their tools_dict so the finally block below
-        # can close every connection regardless of which member raised.
-        tools_cache: Dict[str, Tuple[dict, dict]] = {}
+        all_mcp_clients: list[dict] = []
 
-        async def run_single_member(member_model_id: str) -> Tuple[str, str, dict]:
-            """Run one council member and return (model_id, raw_output, parsed_result)."""
-            system_prompt = base_system_prompt
-            member_model = {}
-            member_model = request.app.state.MODELS.get(member_model_id, {})
+        async def prepare_member(member_model_id: str) -> tuple[dict, dict, dict]:
+            filter_pipeline = await resolve_model_filter_pipeline(
+                self.valves.APPLY_INLET_FILTERS,
+                request,
+                member_model_id,
+                metadata.get("filter_ids", []),
+            )
+            member_model = filter_pipeline["model"]
 
             member_extra_params = {
                 **extra_params,
                 "__model__": member_model,
             }
 
-            cached = tools_cache.get(member_model_id)
-            if cached is None:
-                cached = await build_tools_dict(
-                    request=request,
-                    model=member_model,
-                    metadata=metadata,
-                    user=user,
-                    valves=self.valves,
-                    extra_params=member_extra_params,
-                    tool_id_list=tool_id_list,
-                    excluded_tool_ids=excluded_tool_ids,
-                    resolved_terminal_id=resolved_terminal_id,
-                    resolved_direct_tool_servers=resolved_direct_tool_servers,
-                )
-                # Cache before any further awaits so the outer finally's
-                # cleanup_mcp_clients always sees the live MCP clients,
-                # even if register_view_skill below raises or is cancelled.
-                tools_cache[member_model_id] = cached
-                cached_tools_dict, _ = cached
-                if skills_enabled and skill_manifest:
-                    await register_view_skill(
-                        cached_tools_dict, request, member_extra_params
-                    )
-            tools_dict, _ = cached
+            tools_dict, mcp_clients = await build_tools_dict(
+                request=request,
+                model=member_model,
+                metadata=metadata,
+                user=user,
+                valves=self.valves,
+                extra_params=member_extra_params,
+                tool_id_list=tool_id_list,
+                excluded_tool_ids=excluded_tool_ids,
+                resolved_terminal_id=resolved_terminal_id,
+                resolved_direct_tool_servers=resolved_direct_tool_servers,
+                include_terminal_agents_md=True,
+            )
+            # Retain clients before skill registration can fail or be cancelled.
+            if mcp_clients:
+                all_mcp_clients.append(mcp_clients)
+            if skills_enabled and skill_manifest:
+                await register_view_skill(tools_dict, request, member_extra_params)
+            return filter_pipeline, tools_dict, member_extra_params
+
+        async def run_single_member(
+            member_model_id: str, prepared: tuple[dict, dict, dict] | Exception
+        ) -> Tuple[str, str, dict]:
+            """Run one council member and return (model_id, raw_output, parsed_result)."""
+            if isinstance(prepared, Exception):
+                raise prepared
+            filter_pipeline, tools_dict, member_extra_params = prepared
 
             content = await run_agent_loop(
                 request=__request__,
                 user=user,
                 model_id=member_model_id,
                 messages=[
-                    {"role": "system", "content": system_prompt},
+                    {"role": "system", "content": base_system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
                 tools_dict=tools_dict,
@@ -958,6 +967,7 @@ CRITICAL RULES:
                 apply_inlet_filters=self.valves.APPLY_INLET_FILTERS,
                 agent_name=member_model_id,
                 event_emitter=__event_emitter__,
+                filter_pipeline=filter_pipeline,
             )
 
             parsed = safe_json_loads(content)
@@ -965,13 +975,21 @@ CRITICAL RULES:
 
         import asyncio
 
-        member_tasks = [run_single_member(mid) for mid in model_ids]
         try:
-            results = await asyncio.gather(*member_tasks, return_exceptions=True)
+            # MCP scopes must be entered and exited by this same parent task.
+            prepared_members = []
+            for member_model_id in model_ids:
+                try:
+                    prepared = await prepare_member(member_model_id)
+                except Exception as exc:
+                    prepared = exc
+                prepared_members.append((member_model_id, prepared))
+            results = await asyncio.gather(
+                *(run_single_member(*prepared) for prepared in prepared_members),
+                return_exceptions=True,
+            )
         finally:
-            for _tools, mcp_clients in tools_cache.values():
-                if mcp_clients:
-                    await cleanup_mcp_clients(mcp_clients)
+            await cleanup_mcp_clients(*all_mcp_clients)
 
         members: Dict[str, dict] = {}
         raw_outputs: Dict[str, str] = {}

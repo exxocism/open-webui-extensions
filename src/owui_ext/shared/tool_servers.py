@@ -6,8 +6,8 @@ permission gates, and older paths may still expose it in the request
 body. The plugins in this repo all need the same handful of operations:
 
 - coerce raw payloads into a list of dict copies,
-- trust ``metadata.tool_servers`` when core supplied it and read the
-  request body only as a legacy fallback,
+- trust ``metadata.tool_servers`` when core supplied it, recovering consumed
+  specs from Core's resolved tools and prompts from the same request connection,
 - expand ``specs`` into the per-name dict that core middleware expects,
 - collect non-empty system prompts from the loaded servers.
 
@@ -68,8 +68,43 @@ async def resolve_direct_tool_servers_from_request_and_metadata(
 ) -> list[dict]:
     """Resolve direct tool servers using core-gated metadata as source of truth."""
     metadata_has_tool_servers = isinstance(metadata, dict) and "tool_servers" in metadata
+    servers: list[dict] = []
+    missing_prompts: list[tuple[dict, dict]] = []
+
+    def connection_settings(server: dict) -> dict:
+        return {
+            key: value for key, value in server.items()
+            if key not in {"specs", "system_prompt"}
+        }
+
     if metadata_has_tool_servers:
-        return normalize_direct_tool_servers(metadata.get("tool_servers"))
+        servers = normalize_direct_tool_servers(metadata.get("tool_servers"))
+        parent_tools = metadata.get("tools")
+        parent_tools = parent_tools if isinstance(parent_tools, dict) else {}
+        for server in servers:
+            if "specs" in server and "system_prompt" in server:
+                continue
+            settings = connection_settings(server)
+            approved_specs = [
+                dict(tool["spec"])
+                for tool in parent_tools.values()
+                if isinstance(tool, dict)
+                and tool.get("direct") is True
+                and isinstance(tool.get("server"), dict)
+                and connection_settings(tool["server"]) == settings
+                and isinstance(tool.get("spec"), dict)
+                and isinstance(tool["spec"].get("name"), str)
+                and tool["spec"]["name"]
+            ]
+            # Core pops specs from metadata.tool_servers, but retains only
+            # the permitted entries in metadata.tools. Never use raw specs
+            # to recreate a tool that Core removed.
+            if "specs" not in server and approved_specs:
+                server["specs"] = approved_specs
+            if approved_specs and server.get("specs") and "system_prompt" not in server:
+                missing_prompts.append((server, settings))
+        if not missing_prompts:
+            return servers
 
     request_servers: list[dict] = []
     if request is not None:
@@ -91,9 +126,20 @@ async def resolve_direct_tool_servers_from_request_and_metadata(
                                 )
             except Exception:
                 request_servers = []
-    if request_servers:
+    if not metadata_has_tool_servers:
         return request_servers
-    return []
+
+    for server, settings in missing_prompts:
+        prompts = [
+            candidate.get("system_prompt")
+            for candidate in request_servers
+            if connection_settings(candidate) == settings
+        ]
+        # Prompt-only recovery is safe once Core approved this exact
+        # connection. Ambiguous duplicate connections stay without a prompt.
+        if prompts and all(isinstance(prompt, str) and prompt == prompts[0] for prompt in prompts):
+            server["system_prompt"] = prompts[0]
+    return servers
 
 
 def build_direct_tools_dict(

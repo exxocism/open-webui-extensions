@@ -29,6 +29,24 @@ def make_spec(*param_names: str) -> dict:
     }
 
 
+@pytest.mark.parametrize("name", ["search_web", "run_command"])
+async def test_terminal_events_do_not_parse_unrelated_result_json(monkeypatch, name):
+    def unexpected_parse(_value):
+        raise AssertionError("Non-file tools must not parse their result for a path")
+
+    monkeypatch.setattr(sub_agent.json, "loads", unexpected_parse)
+    events = []
+
+    async def emit(event):
+        events.append(event)
+
+    await sub_agent.emit_terminal_tool_event(
+        tool_function_name=name, tool_function_params={}, tool_result='{"large": "result"}',
+        event_emitter=emit,
+    )
+    assert len(events) == (1 if name == "run_command" else 0)
+
+
 TERMINAL_EVENT_MODULE_CASES = [
     (
         "sub_agent",
@@ -1036,7 +1054,9 @@ async def test_multi_model_council_resolves_terminal_once_before_parallel_member
         excluded_tool_ids,
         resolved_terminal_id=None,
         resolved_direct_tool_servers=None,
+        include_terminal_agents_md=False,
     ):
+        assert include_terminal_agents_md is True
         build_tools_terminal_ids.append(resolved_terminal_id)
         return {}, {}
 
@@ -1222,6 +1242,8 @@ async def test_magi_default_model_resolves_model_for_tool_loading(
 async def test_magi_accepts_basemodel_user_valves(
     monkeypatch, dummy_request, mock_user
 ):
+    dummy_request.app.state.MODELS = {"model-a": {"id": "model-a"}}
+
     class LegacyMagiUserValves(BaseModel):
         INCLUDE_SOURCES: bool = False
 
@@ -1645,6 +1667,31 @@ async def test_parallel_tools_run_tools_parallel_resolves_mcp_tools(
     ]
     assert tool_calls == [{"name": "lookup_docs", "args": {"query": "parallel"}}]
     assert disconnected == [True]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "module", [sub_agent, multi_model_council, magi_decision_support, llm_review]
+)
+@pytest.mark.parametrize("arguments", ["[]", "null", "1", [], None, 1])
+async def test_execute_tool_call_rejects_non_object_arguments(module, arguments):
+    calls = []
+
+    async def tool():
+        calls.append(True)
+        return "executed"
+
+    result = await module.execute_tool_call(
+        tool_call={"id": "invalid-args", "function": {"name": "tool", "arguments": arguments}},
+        tools_dict={"tool": {"callable": tool, "spec": make_spec()}},
+        extra_params={},
+    )
+
+    assert calls == []
+    assert result == {
+        "tool_call_id": "invalid-args",
+        "content": "Error: Tool call arguments must be a JSON object.",
+    }
 
 
 @pytest.mark.asyncio
@@ -2150,6 +2197,34 @@ async def test_sub_agent_execute_direct_tool_uses_event_call_and_session_id():
     assert execute_calls[0]["type"] == "execute:tool"
     assert execute_calls[0]["data"]["session_id"] == "sess-sub-agent"
     assert any(event.get("type") == "terminal:display_file" for event in events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("_module_name", "module", "name_key", "params_key"),
+    TERMINAL_EVENT_MODULE_CASES,
+)
+@pytest.mark.parametrize("tool_name", ["display_file", "write_file", "replace_file_content"])
+@pytest.mark.parametrize("serialize", [False, True])
+async def test_terminal_events_prefer_resolved_result_path(
+    _module_name, module, name_key, params_key, tool_name, serialize
+):
+    events = []
+
+    async def event_emitter(event):
+        events.append(event)
+
+    result = {"path": "/workspace/report.pdf", "exists": True}
+    await module.emit_terminal_tool_event(
+        **{
+            name_key: tool_name,
+            params_key: {"path": "report.pdf"},
+            "tool_result": json.dumps(result) if serialize else result,
+            "event_emitter": event_emitter,
+        }
+    )
+
+    assert events == [{"type": f"terminal:{tool_name}", "data": {"path": result["path"]}}]
 
 
 @pytest.mark.asyncio
@@ -2933,3 +3008,215 @@ async def test_build_tools_dict_classifies_note_knowledge_by_core_capability(
     )
 
     assert ("view_note" in tools_dict) is expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module_name,module", BUILTIN_CATALOG_MODULES)
+@pytest.mark.parametrize("direct", [False, True])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "allowed",
+        "parent_missing",
+        "parent_other_terminal",
+        "parent_regular_tool",
+        "only_read_allowed",
+        "child_other_terminal",
+        "session_missing",
+        "chat_missing",
+        "automation",
+        "internal",
+        "valve_disabled",
+        "model_disabled",
+    ],
+)
+async def test_user_shell_tools_inherit_parent_core_permission(
+    monkeypatch, dummy_request, module_name, module, direct, case
+):
+    import open_webui.utils.tools as ow_tools
+
+    selector = "https://terminal.example.com" if direct else "terminal-1"
+    names = ("read_user_terminal", "send_user_terminal_input")
+    provenance = (
+        {"direct": True, "server": {"url": selector, "is_terminal": True}}
+        if direct
+        else {"type": "terminal", "tool_id": f"terminal:{selector}"}
+    )
+    parent_tools = {name: dict(provenance) for name in names}
+    if case == "parent_missing":
+        parent_tools = {}
+    elif case == "parent_regular_tool":
+        parent_tools = {name: {"type": "tool", "tool_id": "custom"} for name in names}
+    elif case == "parent_other_terminal":
+        parent_tools = {
+            name: {"type": "terminal", "tool_id": "terminal:other"} for name in names
+        }
+    elif case == "only_read_allowed":
+        parent_tools.pop("send_user_terminal_input")
+
+    metadata = {"tools": parent_tools, "session_id": "browser-1", "chat_id": "chat-1"}
+    if case in {"session_missing", "chat_missing"}:
+        metadata.pop("session_id" if case == "session_missing" else "chat_id")
+    elif case in {"automation", "internal"}:
+        metadata["automation_id" if case == "automation" else "internal"] = True
+
+    child_selector = "other" if case == "child_other_terminal" else selector
+
+    async def get_terminal_tools(**kwargs):
+        return {
+            name: {"type": "terminal", "tool_id": f"terminal:{child_selector}"}
+            for name in names
+        } if not direct else {}
+
+    monkeypatch.setattr(ow_tools, "get_terminal_tools", get_terminal_tools)
+    direct_servers = (
+        [{"url": child_selector, "is_terminal": True, "specs": [{"name": name} for name in names]}]
+        if direct else []
+    )
+    tools_dict, _ = await module.build_tools_dict(
+        request=dummy_request,
+        model={"info": {"meta": {"capabilities": {"terminal": case != "model_disabled"}}}},
+        metadata=metadata,
+        user=SimpleNamespace(id="u1"),
+        valves=SimpleNamespace(ENABLE_TERMINAL_TOOLS=case != "valve_disabled"),
+        extra_params={"__metadata__": metadata},
+        tool_id_list=[],
+        excluded_tool_ids=None,
+        resolved_terminal_id=selector,
+        resolved_direct_tool_servers=direct_servers,
+    )
+
+    expected = set(names) if case == "allowed" else {"read_user_terminal"} if case == "only_read_allowed" else set()
+    assert set(tools_dict) == expected
+
+
+@pytest.mark.asyncio
+async def test_user_shell_gate_preserves_regular_tools_with_the_same_name(
+    monkeypatch, dummy_request
+):
+    import open_webui.utils.tools as ow_tools
+
+    tool = {"type": "tool", "tool_id": "custom"}
+
+    async def get_tools(**kwargs):
+        return {"read_user_terminal": tool}
+
+    monkeypatch.setattr(ow_tools, "get_tools", get_tools)
+    tools_dict, _ = await sub_agent.build_tools_dict(
+        request=dummy_request,
+        model={},
+        metadata={},
+        user=SimpleNamespace(id="u1"),
+        valves=SimpleNamespace(ENABLE_TERMINAL_TOOLS=False),
+        extra_params={},
+        tool_id_list=["custom"],
+        excluded_tool_ids=None,
+        resolved_terminal_id="",
+        resolved_direct_tool_servers=[],
+    )
+
+    assert tools_dict == {"read_user_terminal": tool}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case", ["enabled", "disabled_valve", "disabled_model", "no_terminal", "batch", "legacy", "no_file"]
+)
+async def test_tool_loader_reads_terminal_agents_md_once_when_requested(
+    monkeypatch, dummy_request, case
+):
+    calls = []
+    module = ModuleType("open_webui.utils.terminals")
+
+    async def get_terminal_agents_md(request, user, metadata, extra_params):
+        calls.append(metadata["terminal_id"])
+        return None if case == "no_file" else "# AGENTS.md\n\nUse the project conventions."
+
+    if case != "legacy":
+        module.get_terminal_agents_md = get_terminal_agents_md
+    monkeypatch.setitem(sys.modules, "open_webui.utils.terminals", module)
+    metadata = {}
+    extra_params = {"__metadata__": metadata, "__terminal_agents_md__": "stale"}
+
+    await sub_agent.build_tools_dict(
+        request=dummy_request,
+        model={"info": {"meta": {"capabilities": {"terminal": case != "disabled_model"}}}},
+        metadata=metadata,
+        user=SimpleNamespace(id="u1"),
+        valves=SimpleNamespace(ENABLE_TERMINAL_TOOLS=case != "disabled_valve"),
+        extra_params=extra_params,
+        tool_id_list=[],
+        excluded_tool_ids=None,
+        resolved_terminal_id="" if case == "no_terminal" else "terminal-1",
+        resolved_direct_tool_servers=[],
+        include_terminal_agents_md=case != "batch",
+    )
+
+    assert calls == (["terminal-1"] if case in {"enabled", "no_file"} else [])
+    if case == "enabled":
+        assert extra_params["__terminal_agents_md__"] == "# AGENTS.md\n\nUse the project conventions."
+    else:
+        assert "__terminal_agents_md__" not in extra_params
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("also_admin", [False, True])
+async def test_direct_terminal_selector_only_loads_configured_admin_terminal(
+    monkeypatch, dummy_request, also_admin
+):
+    import open_webui.utils.tools as ow_tools
+
+    selector = "https://terminal.example.com"
+    stub_open_webui_config_get(
+        monkeypatch,
+        terminal_server_connections=[{"id": selector}] if also_admin else [],
+    )
+    calls = []
+
+    async def get_terminal_tools(**kwargs):
+        calls.append(kwargs["terminal_id"])
+        return {"admin_tool": {"type": "terminal"}}
+
+    monkeypatch.setattr(ow_tools, "get_terminal_tools", get_terminal_tools)
+    tools_dict, _ = await sub_agent.build_tools_dict(
+        request=dummy_request,
+        model={},
+        metadata={},
+        user=SimpleNamespace(id="u1"),
+        valves=SimpleNamespace(),
+        extra_params={},
+        tool_id_list=[],
+        excluded_tool_ids=None,
+        resolved_terminal_id=selector,
+        resolved_direct_tool_servers=[
+            {"url": selector, "is_terminal": True, "specs": [{"name": "direct_tool"}]}
+        ],
+    )
+
+    assert calls == ([selector] if also_admin else [])
+    assert "direct_tool" in tools_dict
+    assert ("admin_tool" in tools_dict) is also_admin
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disabled_by", ["valve", "model"])
+async def test_direct_terminal_restriction_preserves_other_direct_servers(
+    dummy_request, disabled_by
+):
+    tools_dict, _ = await sub_agent.build_tools_dict(
+        request=dummy_request,
+        model={"info": {"meta": {"capabilities": {"terminal": disabled_by != "model"}}}},
+        metadata={},
+        user=SimpleNamespace(id="u1"),
+        valves=SimpleNamespace(ENABLE_TERMINAL_TOOLS=disabled_by != "valve"),
+        extra_params={},
+        tool_id_list=[],
+        excluded_tool_ids=None,
+        resolved_terminal_id="https://terminal.example.com",
+        resolved_direct_tool_servers=[
+            {"url": "https://terminal.example.com", "is_terminal": True, "specs": [{"name": "run_command"}]},
+            {"url": "https://api.example.com", "specs": [{"name": "get_weather"}]},
+        ],
+    )
+
+    assert set(tools_dict) == {"get_weather"}

@@ -248,58 +248,50 @@ async def resolve_mcp_tools(
             seen_server_ids.add(server_id)
             ordered_server_ids.append(server_id)
 
-    for server_id in ordered_server_ids:
-        client = None
-        try:
-            mcp_server_connection = next(
-                (
-                    server_connection
-                    for server_connection in server_connections
-                    if server_connection.get("type", "") == "mcp"
-                    and server_connection.get("info", {}).get("id") == server_id
-                ),
-                None,
-            )
-
-            if not mcp_server_connection:
-                _mcp_tools_log.warning(f"MCP server with id {server_id} not found")
-                await emit_warning(f"MCP server '{server_id}' was not found")
-                continue
-
-            if not mcp_server_connection.get("config", {}).get("enable", True):
-                if debug:
-                    _mcp_tools_log.info(
-                        f"MCP server {server_id} is disabled; skipping"
-                    )
-                await emit_warning(f"MCP server '{server_id}' is disabled")
-                continue
-
+    try:
+        for server_id in ordered_server_ids:
+            client = None
             try:
-                has_access = await _mcp_maybe_await(
-                    has_connection_access(user, mcp_server_connection)
-                )
-            except TypeError:
-                has_access = await _mcp_maybe_await(
-                    has_connection_access(user, mcp_server_connection, None)
+                mcp_server_connection = next(
+                    (
+                        server_connection
+                        for server_connection in server_connections
+                        if server_connection.get("type", "") == "mcp"
+                        and server_connection.get("info", {}).get("id") == server_id
+                    ),
+                    None,
                 )
 
-            if not has_access:
-                _mcp_tools_log.warning(
-                    f"Access denied to MCP server {server_id} for user {user.id}"
-                )
-                await emit_warning(f"Access denied to MCP server '{server_id}'")
-                continue
+                if not mcp_server_connection:
+                    _mcp_tools_log.warning(f"MCP server with id {server_id} not found")
+                    await emit_warning(f"MCP server '{server_id}' was not found")
+                    continue
 
-            headers = await _build_mcp_headers_with_core(
-                connection=mcp_server_connection,
-                request=request,
-                user=user,
-                server_id=server_id,
-                metadata=metadata,
-                extra_params=extra_params,
-            )
-            if headers is None:
-                headers = await _build_mcp_headers_legacy(
+                if not mcp_server_connection.get("config", {}).get("enable", True):
+                    if debug:
+                        _mcp_tools_log.info(
+                            f"MCP server {server_id} is disabled; skipping"
+                        )
+                    await emit_warning(f"MCP server '{server_id}' is disabled")
+                    continue
+
+                try:
+                    has_access = await _mcp_maybe_await(
+                        has_connection_access(user, mcp_server_connection)
+                    )
+                except TypeError:
+                    has_access = await _mcp_maybe_await(
+                        has_connection_access(user, mcp_server_connection, None)
+                    )
+
+                if not has_access:
+                    _mcp_tools_log.warning(
+                        f"Access denied to MCP server {server_id} for user {user.id}"
+                    )
+                    await emit_warning(f"Access denied to MCP server '{server_id}'")
+                    continue
+
+                headers = await _build_mcp_headers_with_core(
                     connection=mcp_server_connection,
                     request=request,
                     user=user,
@@ -307,102 +299,118 @@ async def resolve_mcp_tools(
                     metadata=metadata,
                     extra_params=extra_params,
                 )
+                if headers is None:
+                    headers = await _build_mcp_headers_legacy(
+                        connection=mcp_server_connection,
+                        request=request,
+                        user=user,
+                        server_id=server_id,
+                        metadata=metadata,
+                        extra_params=extra_params,
+                    )
 
-            function_name_filter_list = mcp_server_connection.get("config", {}).get(
-                "function_name_filter_list", ""
-            )
-            if isinstance(function_name_filter_list, str):
-                function_name_filter_list = [
-                    item.strip()
-                    for item in function_name_filter_list.split(",")
-                    if item.strip()
-                ]
-
-            client = MCPClient()
-            client_lock = asyncio.Lock()
-            setattr(client, "_sub_agent_lock", client_lock)
-
-            await client.connect(
-                url=mcp_server_connection.get("url", ""),
-                headers=headers if headers else None,
-            )
-
-            tool_specs = await client.list_tool_specs() or []
-
-            def make_tool_function(
-                mcp_client: Any,
-                function_name: str,
-                lock: asyncio.Lock,
-            ) -> Callable[..., Any]:
-                async def tool_function(**kwargs):
-                    async with lock:
-                        return await mcp_client.call_tool(
-                            function_name,
-                            function_args=kwargs,
-                        )
-
-                return tool_function
-
-            loaded_tool_count = 0
-            for tool_spec in tool_specs:
-                if not isinstance(tool_spec, dict):
-                    continue
-
-                tool_name = tool_spec.get("name")
-                if not isinstance(tool_name, str) or not tool_name:
-                    continue
-
-                if function_name_filter_list and not is_string_allowed(
-                    tool_name, function_name_filter_list
-                ):
-                    continue
-
-                safe_prefix = re.sub(r"[^a-zA-Z0-9_-]", "_", server_id)
-                prefixed_name = f"{safe_prefix}_{tool_name}"
-                mcp_tools_dict[prefixed_name] = {
-                    "spec": {
-                        **tool_spec,
-                        "name": prefixed_name,
-                    },
-                    "callable": make_tool_function(client, tool_name, client_lock),
-                    "type": "mcp",
-                    "direct": False,
-                }
-                loaded_tool_count += 1
-
-            mcp_clients[server_id] = client
-
-            if debug:
-                _mcp_tools_log.info(
-                    f"Loaded {loaded_tool_count} MCP tools from server {server_id}"
+                function_name_filter_list = mcp_server_connection.get("config", {}).get(
+                    "function_name_filter_list", ""
                 )
-        except Exception as e:
-            _mcp_tools_log.warning(
-                f"Failed to load MCP tools from {server_id}: {e}"
-            )
-            if client is not None:
-                try:
-                    await client.disconnect()
-                except BaseException:
-                    pass
-            await emit_warning(f"Could not load MCP tools from '{server_id}': {e}")
+                if isinstance(function_name_filter_list, str):
+                    function_name_filter_list = [
+                        item.strip()
+                        for item in function_name_filter_list.split(",")
+                        if item.strip()
+                    ]
+
+                client = MCPClient()
+                # Own the client before connect/listing can be cancelled.
+                mcp_clients[server_id] = client
+                client_lock = asyncio.Lock()
+                setattr(client, "_sub_agent_lock", client_lock)
+
+                await client.connect(
+                    url=mcp_server_connection.get("url", ""),
+                    headers=headers if headers else None,
+                )
+
+                tool_specs = await client.list_tool_specs() or []
+
+                def make_tool_function(
+                    mcp_client: Any,
+                    function_name: str,
+                    lock: asyncio.Lock,
+                ) -> Callable[..., Any]:
+                    async def tool_function(**kwargs):
+                        async with lock:
+                            return await mcp_client.call_tool(
+                                function_name,
+                                function_args=kwargs,
+                            )
+
+                    return tool_function
+
+                loaded_tool_count = 0
+                for tool_spec in tool_specs:
+                    if not isinstance(tool_spec, dict):
+                        continue
+
+                    tool_name = tool_spec.get("name")
+                    if not isinstance(tool_name, str) or not tool_name:
+                        continue
+
+                    if function_name_filter_list and not is_string_allowed(
+                        tool_name, function_name_filter_list
+                    ):
+                        continue
+
+                    safe_prefix = re.sub(r"[^a-zA-Z0-9_-]", "_", server_id)
+                    prefixed_name = f"{safe_prefix}_{tool_name}"
+                    mcp_tools_dict[prefixed_name] = {
+                        "spec": {
+                            **tool_spec,
+                            "name": prefixed_name,
+                        },
+                        "callable": make_tool_function(client, tool_name, client_lock),
+                        "type": "mcp",
+                        "direct": False,
+                    }
+                    loaded_tool_count += 1
+
+                if debug:
+                    _mcp_tools_log.info(
+                        f"Loaded {loaded_tool_count} MCP tools from server {server_id}"
+                    )
+            except Exception as e:
+                _mcp_tools_log.warning(
+                    f"Failed to load MCP tools from {server_id}: {e}"
+                )
+                if client is not None:
+                    mcp_clients.pop(server_id, None)
+                    await cleanup_mcp_clients({server_id: client})
+                await emit_warning(f"Could not load MCP tools from '{server_id}': {e}")
+    except BaseException:
+        await cleanup_mcp_clients(mcp_clients)
+        raise
 
     return mcp_tools_dict, mcp_clients
 
 
-async def cleanup_mcp_clients(mcp_clients: dict) -> None:
-    """Disconnect all MCP clients, absorbing non-Exception failures.
+async def cleanup_mcp_clients(mcp_clients: dict | None = None, *more_clients: dict) -> None:
+    """Close client groups in reverse acquisition order in their opening task.
 
-    Some callers open MCP clients inside child tasks (e.g. coroutines
-    fed to ``asyncio.gather``) and close them from an outer ``finally``.
-    Catching ``BaseException`` keeps anyio cancel-scope failures (raised
-    outside the ``Exception`` hierarchy on cross-task cleanup) and
-    ``asyncio.CancelledError`` from escaping the caller and discarding
-    the tool's response. Matches upstream Open WebUI main.py chat
-    handler MCP cleanup (#24105).
+    Error suppression cannot repair cross-task or out-of-order teardown.
+    Preserve the response on internal cleanup errors, but re-raise genuine
+    task cancellation after attempting the remaining clients.
     """
-    for client in reversed(list((mcp_clients or {}).values())):
-        try:
-            await client.disconnect()
-        except BaseException as e:
-            _mcp_tools_log.debug(f"Error cleaning up MCP client: {e}")
+    cancelled = None
+    for clients in reversed((mcp_clients, *more_clients)):
+        for client in reversed(list((clients or {}).values())):
+            try:
+                await client.disconnect()
+            except asyncio.CancelledError as exc:
+                task = asyncio.current_task()
+                if task is not None and task.cancelling():
+                    cancelled = exc
+                else:
+                    _mcp_tools_log.debug(f"Internal MCP cleanup cancellation: {exc}")
+            except BaseException as exc:
+                _mcp_tools_log.debug(f"Error cleaning up MCP client: {exc}")
+    if cancelled is not None:
+        raise cancelled
